@@ -4,6 +4,7 @@ from collections import namedtuple
 import sbnet.ops
 from math import floor
 import time
+import gc
 BlockParams = namedtuple('BlockParams', ['bsize', 'bsize_out', 'boffset', 'bcount', 'bstrides', 'padding'])
 ReduceMask = namedtuple('ReduceMask', ['active_block_indices', 'bin_counts'])
 
@@ -201,7 +202,6 @@ class SparseBlock(torch.nn.Module):
         block_params= args[3] if len(args)>3 else None
 
         #assert inp.is_contiguous(memory_format=torch.channels_last)
-
         # If training, do regular convolution
         if block_params is None and self.block_params is None:
             # Calibration on the fly
@@ -305,6 +305,9 @@ class SparseBlock_Conv2d(SparseBlock):
     def fill_bias(self, val):
         self.conv.bias.data.fill_(val)
 
+    def forward(self, args):
+        return super().forward(args)
+
 class SparseBlock_Conv2d_BN_ReLU(SparseBlock_Conv2d):
     def __init__(self, in_channels, out_channels, kernel_size, stride=1, groups=1,
             bias=True, bn_eps=1e-05, bn_momentum=0.1, norm_groups=None, bcount=None, 
@@ -332,6 +335,9 @@ class SparseBlock_Conv2d_BN_ReLU(SparseBlock_Conv2d):
     def fill_bias(self, val):
         self.conv[0].bias.data.fill_(val)
 
+    def forward(self, args):
+        return super().forward(args)
+
 class SparseBlock_ConvChain(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -344,9 +350,8 @@ class SparseBlock_ConvChain(torch.nn.Module):
         if not self.calibrated:
             self.calibrate(args)
 
-        for conv in conv_list:
-            print('Running convolution,', conv.do_gather, conv.do_scatter)
-            args = conv(args)
+        for conv in self.conv_list:
+            args = conv.forward(args)
         return args
 
     def append_conv(self, conv_module):
@@ -357,12 +362,13 @@ class SparseBlock_ConvChain(torch.nn.Module):
 
     def calibrate(self, args):
         # First, run through the network to calculate default block params
+
+        #assert args[0].is_contiguous(memory_format=torch.channels_last)
         inp_sizes = []
-        assert args[0].is_contiguous(memory_format=torch.channels_last)
         initial_inp=args[0]
         for conv in self.conv_list:
             inp_sizes.append(args[0].size())
-            args = conv(args)
+            args = conv.forward(args)
 
         self.calibrated=True # To prevent recursive calibrate call
 
@@ -428,24 +434,23 @@ class SparseBlock_ConvChain(torch.nn.Module):
                         print(f'New block params for conv {conv_idx}: {bp}')
                         self.conv_list[conv_idx].block_params = bp
                         conv_idx = chain_end_idx + 1 # proceed to next gather
-                print(conv_idx)
-
 
             # Benchmark the current chain config for different sparsities
             repetition, sparsities = 10,  (0.5, 0.6, 0.7, 0.8, 0.9)
-#            time_ms_per_sparsity=[]
-#            for sparsity in sparsities:
-#                args = (initial_inp, gen_reducemask(bp.bcount, sparsity))
-#                self(args) # this call is to invoke cudnn benchmarking
-#                torch.cuda.synchronize()
-#                t1 = time.time()
-#                for i in range(repetition):
-#                    self(args)
-#                torch.cuda.synchronize()
-#                tdiff_ms = round((time.time()-t1)/repetition*1000,2)
-#                time_ms_per_sparsity.append(tdiff_ms)
-#            print('Timings in ms for sparsities from 0.5 to 0.9:', time_ms_per_sparsity)
-#            pattern_timings.append(time_ms_per_sparsity)
+            time_ms_per_sparsity=[]
+            for sparsity in sparsities:
+                gc.collect()
+                args = (initial_inp, gen_reducemask(bp.bcount, sparsity))
+                self.forward(args) # this call is to invoke cudnn benchmarking
+                torch.cuda.synchronize()
+                t1 = time.time()
+                for i in range(repetition):
+                    self.forward(args)
+                torch.cuda.synchronize()
+                tdiff_ms = round((time.time()-t1)/repetition*1000,2)
+                time_ms_per_sparsity.append(tdiff_ms)
+            print('Timings in ms for sparsities from 0.5 to 0.9:', time_ms_per_sparsity)
+            pattern_timings.append(time_ms_per_sparsity)
 
         # What is left is to choose the pattern with best timing, also the pattern
         # can be different depending on sparsity, let's see...
