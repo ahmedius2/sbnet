@@ -3,7 +3,8 @@ import numpy as np
 from collections import namedtuple
 import sbnet.ops
 from math import floor
-BlockParams = namedtuple('BlockParams', ['bsize', 'bsize_out', 'boffset', 'bcount', 'bstrides'])
+import time
+BlockParams = namedtuple('BlockParams', ['bsize', 'bsize_out', 'boffset', 'bcount', 'bstrides', 'padding'])
 ReduceMask = namedtuple('ReduceMask', ['active_block_indices', 'bin_counts'])
 
 # if this returns an integer, it is successful
@@ -33,21 +34,43 @@ def calc_block_params_and_padding_1d(bcount, insize, ksize, stride, deconv=False
     bstride =  bsize - ksize + stride
     return (bsize, bsize_out, boffset, bcount, bstride, abs(pad))
 
-def gen_full_reducemask(bcount):
+def calc_block_params(inp, bcount, ksize, stride, deconv=False, invpad=False):
+    N, C, H, W = list(inp.size())
+    H_bsize, H_bsize_out, H_boffset, H_bcount, H_bstride, H_pad = \
+            calc_block_params_and_padding_1d(bcount[0], H, ksize, \
+            stride, deconv, invpad)
+    W_bsize, W_bsize_out, W_boffset, W_bcount, W_bstride, W_pad = \
+            calc_block_params_and_padding_1d(bcount[1], W, ksize, \
+            stride, deconv, invpad)
+
+    padding_params=None
+    if H_pad > 0 or W_pad > 0:
+        pad_bottom, pad_top = H_pad//2+(H_pad%2), H_pad//2
+        pad_right, pad_left = W_pad//2+(W_pad%2), W_pad//2
+        padding_params = (pad_left, pad_right, pad_top, pad_bottom, 0, 0)
+
+    return BlockParams(bsize=[H_bsize, W_bsize], bsize_out=[H_bsize_out, W_bsize_out],
+            boffset=[H_boffset, W_boffset], bcount=bcount, bstrides=[H_bstride, W_bstride],
+            padding=padding_params)
+
+def gen_reducemask(bcount, sparsity=0.):
+    assert sparsity >= 0. and sparsity < 1.
     max_num_blocks= bcount[0] * bcount[1]
     inds = torch.empty((max_num_blocks, 3), dtype=torch.int16)
     for i in range(bcount[0]):
         for j in range(bcount[1]):
             inds[i * bcount[1] + j] = torch.tensor((0, i, j), dtype=torch.int16)
     inds = inds.cuda()
-    counts = torch.full((1,), max_num_blocks, dtype=torch.int32)
-    return ReduceMask(inds, counts)
+    counts = torch.full((1,), (bcount[0] * bcount[1]) * (1.0 - sparsity), \
+            dtype=torch.int32)
+    perms = torch.randperm(bcount[0] * bcount[1]) # shuffle
+    return ReduceMask(inds[perms], counts)
 
 class SparseGatherFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, inp_NHWC, redu_mask, bp, do_transpose):
+    def forward(ctx, inp, redu_mask, bp, do_transpose):
         stacked_slices = sbnet.ops.sparse_gather(
-            inp_NHWC,
+            inp,
             redu_mask.bin_counts,
             redu_mask.active_block_indices,
             bsize=bp.bsize,
@@ -55,7 +78,7 @@ class SparseGatherFunction(torch.autograd.Function):
             boffset=bp.boffset,
             transpose=do_transpose)
 
-        ctx.inp_size = tuple(inp_NHWC.size())
+        ctx.inp_size = tuple(inp.size())
         ctx.redu_mask = redu_mask
         ctx.bp = bp
         ctx.do_transpose = do_transpose
@@ -141,71 +164,64 @@ class SparseBlock(torch.nn.Module):
         self.stride = None
         self.out_channels = None
         self.deconv = None
-        self.padding_params = None
         self.block_params = None
         self.bcount=bcount
         self.transpose=transpose
+        self.do_gather = True
+        self.do_scatter = True
 
         self.invpad = False
 
     # bcount : [H_bcount, W_bcount]
-    def calibrate(self, inp_NHWC, bcount=None):
+    def calibrate(self, inp, bcount=None):
         assert (bcount is not None or self.bcount is not None) and self.conv is not None
         bcount = self.bcount if bcount is None else bcount
-        N, C, H, W = list(inp_NHWC.size())
-        H_bsize, H_bsize_out, H_boffset, H_bcount, H_bstride, H_pad = \
-                calc_block_params_and_padding_1d(bcount[0], H, self.kernel_size, \
-                self.stride, self.deconv, self.invpad)
-        W_bsize, W_bsize_out, W_boffset, W_bcount, W_bstride, W_pad = \
-                calc_block_params_and_padding_1d(bcount[1], W, self.kernel_size, \
-                self.stride, self.deconv, self.invpad)
-        # I am not sure whether calculating H and W params like this and simply
-        # merging is ok, but let's try!
-        if H_pad > 0 or W_pad > 0:
-            pad_bottom, pad_top = H_pad//2+(H_pad%2), H_pad//2
-            pad_right, pad_left = W_pad//2+(W_pad%2), W_pad//2
-            self.padding_params = (pad_left, pad_right, pad_top, pad_bottom, 0, 0)
- 
-        self.block_params= BlockParams(bsize=[H_bsize, W_bsize], bsize_out=[H_bsize_out, W_bsize_out],
-                boffset=[H_boffset, W_boffset], bcount=bcount, bstrides=[H_bstride, W_bstride])
-        print('Block params for input ', inp_NHWC.size(),' :', self.block_params)
-        # Run the convolution once with full mask 
-        redu_mask = gen_full_reducemask(self.block_params.bcount)
 
-        if not self.training:
-            # Try all input sizes for benchmarking
-            while redu_mask.bin_counts.item() > 0:
-                self.forward((inp_NHWC, redu_mask))
-                redu_mask.bin_counts[0] -= 1
+        self.block_params = calc_block_params(inp, bcount, self.kernel_size, self.stride, \
+                self.deconv, self.invpad)
+        print('Calibrated block params for input ', inp.size(),' :', self.block_params)
 
-    # args are supposed to be: inp_NHWC, redu_mask, atomic=False, block_params=None):
+        #DEBUG 
+#        # Run the convolution once with full mask 
+#        redu_mask = gen_reducemask(self.block_params.bcount)
+#
+#        if not self.training:
+#            # Try all input sizes for benchmarking, takes a long time...
+#            while redu_mask.bin_counts.item() > 0:
+#                self.forward((inp, redu_mask))
+#                redu_mask.bin_counts[0] -= 1
+
+    # args are supposed to be: inp, redu_mask, atomic=False, block_params=None):
     def forward(self, args):
         assert self.conv is not None
 
-        inp_NHWC=args[0]
+        inp=args[0]
         redu_mask=args[1]
         atomic = args[2] if len(args)>2 else False
         block_params= args[3] if len(args)>3 else None
 
-        #assert inp_NHWC.is_contiguous(memory_format=torch.channels_last)
+        #assert inp.is_contiguous(memory_format=torch.channels_last)
 
         # If training, do regular convolution
-        if self.block_params is None:
+        if block_params is None and self.block_params is None:
             # Calibration on the fly
-            self.calibrate(inp_NHWC, self.bcount)
+            self.calibrate(inp, self.bcount)
 
         bp = self.block_params if block_params is None else block_params
         #assert bp is not None, 'Block parameters should either be initalized or given'
+        #torch.cuda.nvtx.range_push(f'SBC_inp_{list(inp.size())}')
+        if self.do_gather:
+            padding_params = bp.padding
+            if padding_params is not None:
+                if self.invpad:
+                    wl, wr, hl, hr, cl, cr = padding_params
+                    inp = inp[..., hl:-hr, wl:-wr] # not sure if this involves copy or not
+                else:
+                    inp = torch.nn.functional.pad(inp, padding_params)
 
-        #torch.cuda.nvtx.range_push(f'SBC_inp_{list(inp_NHWC.size())}')
-        if self.padding_params is not None:
-            if self.invpad:
-                wl, wr, hl, hr, cl, cr = self.padding_params
-                inp_NHWC = inp_NHWC[..., hl:-hr, wl:-wr] # not sure if this involves copy or not
-            else:
-                inp_NHWC = torch.nn.functional.pad(inp_NHWC, self.padding_params)
-
-        p = SparseGatherFunction.apply(inp_NHWC, redu_mask, bp, self.transpose)
+            p = SparseGatherFunction.apply(inp, redu_mask, bp, self.transpose)
+        else:
+            p = inp
 
 #        # DEBUG check if gather works as expected
 #        inds = redu_mask.active_block_indices.cpu()
@@ -213,7 +229,7 @@ class SparseBlock(torch.nn.Module):
 #        for ind in inds:
 #            xpos = ind[1]*bp.bstrides[0]
 #            ypos = ind[2]*bp.bstrides[1]
-#            slc = inp_NHWC[ind[0]:(ind[0]+1), ..., xpos:(xpos+bp.bsize[0]), ypos:(ypos+bp.bsize[1])]
+#            slc = inp[ind[0]:(ind[0]+1), ..., xpos:(xpos+bp.bsize[0]), ypos:(ypos+bp.bsize[1])]
 #            slices.append(slc)
 #        slices = torch.cat(slices, dim=0)
 #        if self.transpose:
@@ -230,17 +246,22 @@ class SparseBlock(torch.nn.Module):
         # Convolution on patches.
         q = self.conv(p)
 
-        # Allocate output tensor as NHWC
-        outp_sz = [int(inp_NHWC.size(0)), #N
-            int(self.out_channels), #C
-            int(calc_out_size_1d(bp.bcount[0], bp.bsize[0], 
-                    self.kernel_size, self.stride, self.deconv)), #H
-            int(calc_out_size_1d(bp.bcount[1], bp.bsize[1],
-                    self.kernel_size, self.stride, self.deconv)), #W
-        ]
+        if self.do_scatter:
+            # Allocate output tensor as NHWC
+            # TODO batch size can be different than 1 in case of no gather
+            batch_size = 1 if self.do_gather else int(inp.size(0))
+            outp_sz = [batch_size, #N 
+                int(self.out_channels), #C
+                int(calc_out_size_1d(bp.bcount[0], bp.bsize[0], 
+                        self.kernel_size, self.stride, self.deconv)), #H
+                int(calc_out_size_1d(bp.bcount[1], bp.bsize[1],
+                        self.kernel_size, self.stride, self.deconv)), #W
+            ]
 
-        y = SparseScatterFunction.apply(q, redu_mask, outp_sz, bp, False, \
-                self.transpose, atomic)
+            y = SparseScatterFunction.apply(q, redu_mask, outp_sz, bp, False, \
+                    self.transpose, atomic)
+        else:
+            y = q
 
 #        # DEBUG check if scatter works as expected
 #        scat_plane = torch.zeros(outp_sz, dtype=q.dtype, device=q.device)
@@ -262,7 +283,7 @@ class SparseBlock(torch.nn.Module):
 
 class SparseBlock_Conv2d(SparseBlock):
     def __init__(self, in_channels, out_channels, kernel_size, stride=1, groups=1,
-            bias=True, bcount=None, transpose=False, deconv=False):
+                bias=True, bcount=None, transpose=False, deconv=False):
         super().__init__(bcount, transpose)
         self.kernel_size = kernel_size
         self.stride = stride
@@ -303,7 +324,6 @@ class SparseBlock_Conv2d_BN_ReLU(SparseBlock_Conv2d):
             norm = torch.nn.BatchNorm2d(out_channels, eps=bn_eps, momentum=bn_momentum)
         else:
             norm = torch.nn.GroupNorm(norm_groups, out_channels, eps=bn_eps)
-            print('using group norm')
         self.conv = torch.nn.Sequential(self.conv, norm, torch.nn.ReLU())
 
         if not self.transpose:
@@ -311,3 +331,126 @@ class SparseBlock_Conv2d_BN_ReLU(SparseBlock_Conv2d):
     
     def fill_bias(self, val):
         self.conv[0].bias.data.fill_(val)
+
+class SparseBlock_ConvChain(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        self.conv_list = torch.nn.ModuleList()
+        self.calibrated = False
+
+    def forward(self, args):
+        assert args[0].is_contiguous(memory_format=torch.channels_last)
+        if not self.calibrated:
+            self.calibrate(args)
+
+        for conv in conv_list:
+            print('Running convolution,', conv.do_gather, conv.do_scatter)
+            args = conv(args)
+        return args
+
+    def append_conv(self, conv_module):
+        assert isinstance(conv_module, SparseBlock_Conv2d_BN_ReLU) or \
+            isinstance(conv_module, SparseBlock_Conv2d)
+
+        self.conv_list.append(conv_module)
+
+    def calibrate(self, args):
+        # First, run through the network to calculate default block params
+        inp_sizes = []
+        assert args[0].is_contiguous(memory_format=torch.channels_last)
+        initial_inp=args[0]
+        for conv in self.conv_list:
+            inp_sizes.append(args[0].size())
+            args = conv(args)
+
+        self.calibrated=True # To prevent recursive calibrate call
+
+        # Now, try out different combinations by enabling/disabling scat/gather
+        # First layer has to gather, last layer has to scatter
+        pattern_timings=[]
+        num_convs = len(self.conv_list)
+        for sg_mask in range(2**(num_convs-1)):
+            print('Benchmarking scatter/gather pattern:', sg_mask)
+            # Based on sg_mask, determine gather/scatter operations
+            # First layer always gathers
+            self.conv_list[0].do_gather = True
+            for j in range(num_convs-1):
+                do_sg = (sg_mask & (1 << (num_convs-j-2)) != 0)
+                self.conv_list[j].do_scatter  = do_sg
+                self.conv_list[j+1].do_gather = do_sg
+            # Last layer always scatters
+            self.conv_list[-1].do_scatter = True
+
+            # Detect the gs chains and update block params
+            conv_idx  = 0
+            while conv_idx < num_convs:
+                if self.conv_list[conv_idx].do_gather:
+                    chain_end_idx = conv_idx
+                    while not self.conv_list[chain_end_idx].do_scatter:
+                        chain_end_idx += 1
+                    if conv_idx == chain_end_idx:
+                        # Same layer gathers and scatters, proceed to next
+                        print(f'Block params for conv {conv_idx}: {bp}')
+                        conv_idx += 1
+                    else:
+                        # Chain detected, update the block params of gathering layer
+                        bp = self.conv_list[chain_end_idx].block_params
+                        bsize_out_unit, bsize_out_pair = 1, 2
+                        bsize_arr = np.array((bsize_out_unit, bsize_out_pair, bp.bsize_out[0]))
+                        for k in range(chain_end_idx, conv_idx-1, -1):
+                            conv = self.conv_list[k]
+                            bsize_arr = (bsize_arr - 1) * \
+                                    conv.stride + conv.kernel_size
+
+                        # Assume block w and h are same
+                        bsize = [int(bsize_arr[2])] * 2
+                        boverlap = bsize_arr[1] - 2 * (bsize_arr[1] - bsize_arr[0])
+                        bstrides = [bsize[0] - boverlap, bsize[1] - boverlap]
+                        bsize_out = [int((bsize[0]-conv.kernel_size)/conv.stride+1),
+                                int((bsize[1]-conv.kernel_size)/conv.stride+1)]
+
+                        # Based on these, calculate the padding 
+                        inp_size = inp_sizes[conv_idx]
+                        req_inp_size_H = (bp.bcount[0]  - 1) * bstrides[0] + bsize[0]
+                        req_inp_size_W = (bp.bcount[1]  - 1) * bstrides[1] + bsize[1]
+                        H_pad = req_inp_size_H - inp_size[2]
+                        W_pad = req_inp_size_W - inp_size[3]
+                        assert H_pad >= 0 and W_pad >= 0
+                        if H_pad > 0 or W_pad > 0:
+                            pad_bottom, pad_top = H_pad//2+(H_pad%2), H_pad//2
+                            pad_right, pad_left = W_pad//2+(W_pad%2), W_pad//2
+                            padding_params = (pad_left, pad_right, pad_top, pad_bottom, 0, 0)
+
+                        # Override the block params
+                        bp = BlockParams(bsize, bsize_out, bp.boffset,
+                                bp.bcount, bstrides, padding_params)
+                        print(f'New block params for conv {conv_idx}: {bp}')
+                        self.conv_list[conv_idx].block_params = bp
+                        conv_idx = chain_end_idx + 1 # proceed to next gather
+                print(conv_idx)
+
+
+            # Benchmark the current chain config for different sparsities
+            repetition, sparsities = 10,  (0.5, 0.6, 0.7, 0.8, 0.9)
+#            time_ms_per_sparsity=[]
+#            for sparsity in sparsities:
+#                args = (initial_inp, gen_reducemask(bp.bcount, sparsity))
+#                self(args) # this call is to invoke cudnn benchmarking
+#                torch.cuda.synchronize()
+#                t1 = time.time()
+#                for i in range(repetition):
+#                    self(args)
+#                torch.cuda.synchronize()
+#                tdiff_ms = round((time.time()-t1)/repetition*1000,2)
+#                time_ms_per_sparsity.append(tdiff_ms)
+#            print('Timings in ms for sparsities from 0.5 to 0.9:', time_ms_per_sparsity)
+#            pattern_timings.append(time_ms_per_sparsity)
+
+        # What is left is to choose the pattern with best timing, also the pattern
+        # can be different depending on sparsity, let's see...
+
+
+
+
+
