@@ -1,6 +1,10 @@
-from setuptools import setup, Extension
-from torch.utils import cpp_extension
+from setuptools import setup
+from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 setup(name='sbnet',
-      ext_modules=[cpp_extension.CppExtension('sbnet', ['reduce_mask.cc'])],
-      cmdclass={'build_ext': cpp_extension.BuildExtension})
+		ext_modules=[CUDAExtension('sbnet', [
+			'reduce_mask_cuda.cu', 'reduce_mask.cpp'
+		])],
+		cmdclass={
+			'build_ext': BuildExtension
+	})

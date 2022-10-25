@@ -22,9 +22,15 @@
 #
 
 import torch
-import sbnet
 import numpy as np
 import sys
+
+from torch.utils.cpp_extension import load
+sbnet_path = '/root/sbnet/sbnet_pytorch/sbnet_ops'
+sbnet= load(
+    'sbnet', [sbnet_path + '/reduce_mask.cpp', sbnet_path + '/reduce_mask_cuda.cu'],
+	verbose=True)
+help(sbnet)
 
 def divup(a, b):
     return (a+b-1) // b
@@ -41,27 +47,35 @@ blockCount = [divup(hw, blockStride[0]), divup(hw, blockStride[1])]
 # build kwargs to simplify op calls
 inBlockParams = { "bsize": blockSize, "boffset": blockOffset, "bstride": blockStride }
 #outBlockParams = { "bsize ": [blockSize[0]-2, blockSize[1]-2], "boffset": blockOffset, "bstride": blockStride }
+for i in range(100):
+	# create a random mask representing attention/a priori sparsity
+	# threshold the mask to a specified percentile sparsity
+	mask = np.random.randn(batch, blockCount[0], blockCount[1], channels).astype(np.float32)
+	#threshold = np.percentile(mask, 90)
+	#sparseMask = np.greater(mask, threshold).astype(np.float32)
 
-# create a random mask representing attention/a priori sparsity
-# threshold the mask to a specified percentile sparsity
-mask = np.random.randn(batch, blockCount[0], blockCount[1], channels).astype(np.float32)
-#threshold = np.percentile(mask, 90)
-#sparseMask = np.greater(mask, threshold).astype(np.float32)
+	# upsample the mask to full resolution
+	#upsampledMask = sparseMask.repeat(blockStride[0], axis=1).repeat(blockStride[1], axis=2)
 
-# upsample the mask to full resolution
-#upsampledMask = sparseMask.repeat(blockStride[0], axis=1).repeat(blockStride[1], axis=2)
+	# create a random input tensor
+	x = torch.from_numpy( np.random.randn(batch, hw, hw, channels).astype(np.float32) )
 
-# create a random input tensor
-x = torch.from_numpy( np.random.randn(batch, hw, hw, channels).astype(np.float32) )
+	# create a random weight tensor
+	w = torch.from_numpy( np.random.randn(3, 3, channels, channels).astype(np.float32) )
 
-# create a random weight tensor
-w = torch.from_numpy( np.random.randn(3, 3, channels, channels).astype(np.float32) )
-
-# reduce the mask to indices by using a fused pooling+indexing operation
-mask = torch.from_numpy(mask)
-counts, indices = sbnet.reduce_mask(mask, blockCount, **inBlockParams, avgpool=True, tol=0.05)
-print('counts', counts.size(), counts)
-print('indices', indices.size(), indices)
+	# reduce the mask to indices by using a fused pooling+indexing operation
+	mask = torch.from_numpy(mask)
+	counts2, indices2 = sbnet.reduce_mask(mask.cuda(), blockCount, **inBlockParams, avgpool=True, tol=0.05)
+	counts1, indices1 = sbnet.reduce_mask(mask, blockCount, **inBlockParams, avgpool=True, tol=0.05)
+	indices1=indices1[:counts1[0]]
+	indices2=indices2[:counts2[0]]
+	if not torch.equal(counts1, counts2.cpu()) or \
+			not torch.equal(indices1, indices2.cpu()):
+		print('Possible error, please check:')
+		print('counts1', counts1.size(), counts1)
+		print('indices1', indices1.size(), indices1)
+		print('counts2', counts2.size(), counts2)
+		print('indices2', indices2.size(), indices2)
 
 #### REST IS TODO ####
 sys.exit()

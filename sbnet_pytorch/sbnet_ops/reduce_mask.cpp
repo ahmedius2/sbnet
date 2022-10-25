@@ -24,12 +24,30 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+
+void LaunchReduceMaskGPU(
+	torch::Tensor mask,               // Mask array.
+    int N,                            // Batch dimension of the mask.
+    int H,                            // Height of the mask.
+    int W,                            // Width of the mask.
+    float threshold,                  // Threshold for being active.
+    int bOffsH0,                      // Block padding offset height, negative.
+    int bOffsW0,                      // Block padding offset width, negative.
+    int bSzH,                         // Block size height.
+    int bSzW,                         // Block size width.
+    int bStrH,                        // Block stride, height.
+    int bStrW,                        // Block stride, width.
+    int bCntH,                        // Number of blocks, height.
+    int bCntW,                        // Number of blocks, width.
+    unsigned int numBins,             // number of bins in binCounts
+    unsigned int binSize,             // maximum size of each counter bin
+    torch::Tensor activeBlockIndices, // triples of [n, ih, iw] indices for active blocks.
+    torch::Tensor binCounts,          // Number of indices of active blocks.
+    bool avgPool                      // true for avg pooling, false for max pooling
+);
+
+
 //#include <cuda_runtime_api.h>
-
-//#include "op_utils.h"
-
-//using std::cout;
-//using std::endl;
 
 // CPU implementation of reduce mask op.
 // This is a naive CPU implementation, just for reference comparison/testing purposes.
@@ -39,7 +57,7 @@ void ReduceMaskCPU(
     int N,                          // Batch dimension of the mask.
     int H,                          // Height of the mask.
     int W,                          // Width of the mask.
-    float threshold,                // Threshold for being active.
+    scalar_t threshold,                // Threshold for being active.
     int bOffsH0,                    // Block padding offset height, negative.
     int bOffsW0,                    // Block padding offset width, negative.
     int bSzH,                       // Block size height.
@@ -48,8 +66,8 @@ void ReduceMaskCPU(
     int bStrW,                      // Block stride, width.
     int bCntH,                      // Number of blocks, height.
     int bCntW,                      // Number of blocks, width.
-    int16_t* activeBlockIndices,    // Indices of active blocks. OUTPUT
-    int32_t* binCounts,             // Number of active indices. OUTPUT
+    int16_t* activeBlockIndices,   // Indices of active blocks. OUTPUT
+    int32_t* binCounts,            // Number of active indices. OUTPUT
     bool avgPool
     )
 {
@@ -61,11 +79,11 @@ void ReduceMaskCPU(
         int h0 = bOffsH0 + bh * bStrH;
         int w0 = bOffsW0 + bw * bStrW;
         bool active = false; // Whether a block is active.
-        float sum = 0.0f;
+        scalar_t sum = 0.0f;
         for (int hh = std::max(0, h0); hh < h0 + bSzH && hh < H; ++hh) {
         for (int ww = std::max(0, w0); ww < w0 + bSzW && ww < W; ++ww) {
         for (int cc = 0; cc < C; cc++) {
-            float val = mask[n*H*W*C + hh*W*C + ww*C + cc];
+            scalar_t val = mask[n*H*W*C + hh*W*C + ww*C + cc];
             if (avgPool)
                 sum += val;
             else
@@ -82,6 +100,7 @@ void ReduceMaskCPU(
     } } }
     *binCounts = count;
 }
+
 
 
 std::pair<torch::Tensor, torch::Tensor> ReduceMask(torch::Tensor mask,
@@ -123,9 +142,9 @@ std::pair<torch::Tensor, torch::Tensor> ReduceMask(torch::Tensor mask,
 
     torch::Tensor binCounts = torch::empty({numBins}, tensor_options.dtype(torch::kInt32));
 
-	AT_DISPATCH_ALL_TYPES(mask.scalar_type(), "ReduceMask", ([&] {
 		if (mask_device == torch::kCPU){
-    			assert(numBins == 1);
+    		assert(numBins == 1);
+			AT_DISPATCH_ALL_TYPES(mask.scalar_type(), "ReduceMaskCPU", ([&] {
 				ReduceMaskCPU<scalar_t>(
 					mask.data_ptr<scalar_t>(),                // Mask array.
 					N,                                        // Batch dimension of the mask.
@@ -144,12 +163,31 @@ std::pair<torch::Tensor, torch::Tensor> ReduceMask(torch::Tensor mask,
 					binCounts.data_ptr<int32_t>(),            // Counts per bin of active blocks.
 					avgpool_
 				);
+			}));
 		}
 		else{
 			// call GPU equivalent
-			// ...
+            LaunchReduceMaskGPU(
+				mask,                                     // Mask array.
+				N,                                        // Batch dimension of the mask.
+				H,                                        // Height of the mask.
+				W,                                        // Width of the mask.
+				tol_,                                     // Threshold for being active.
+				bOffsH0,                                  // Block padding offset height.
+				bOffsW0,                                  // Block padding offset width.
+				bSzH,                                     // Block size height.
+				bSzW,                                     // Block size width.
+				bStrH,                                    // Block stride, height.
+				bStrW,                                    // Block stride, width.
+				bCntH,                                    // Number of blocks, height.
+				bCntW,                                    // Number of blocks, width.
+				numBins,
+				binSize,
+				activeBlockIndices,                       // Indices of active blocks.
+				binCounts,                                // Counts per bin of active blocks.
+				avgpool_
+			);
 		}
-	}));
 
 	return {binCounts, activeBlockIndices};
 }
