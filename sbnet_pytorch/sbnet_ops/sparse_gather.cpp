@@ -1,0 +1,223 @@
+/*
+
+   Sparse Blocks Network
+   Copyright (c) 2017, Uber Technologies, Inc.
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+
+*/
+
+#include <torch/extension.h>
+
+#include <algorithm>
+#include <cmath>
+#include <iostream>
+#include <mutex>
+#include <omp.h>
+#include <vector>
+
+//#include <cuda_runtime.h>
+
+//#include "op_utils.h"
+//#include "sparse_gather.h"
+
+// CPU specialization of actual computation.
+// This is a naive CPU implementation, just for testing purpose.
+template <typename scalar_t>
+void SparseGatherCPU(
+		const scalar_t* x, int N, int H, int W, int C, scalar_t* y,
+		int bOffsH0, int bOffsW0, int bSzH, int bSzW, int bStrH, int bStrW,
+		int numActive, const int16_t* activeBlockIndices, bool transpose)
+{
+    const int R = bSzH, S = bSzW;
+    #pragma omp parallel for
+    for (int ib = 0; ib < numActive; ib++) {
+        int biN = activeBlockIndices[ib*3+0];
+        int biH = activeBlockIndices[ib*3+1];
+        int biW = activeBlockIndices[ib*3+2];
+        int h0 = bOffsH0 + biH * bStrH;
+        int w0 = bOffsW0 + biW * bStrW;
+        for (int intraBh = 0; intraBh < R; ++intraBh) {
+        for (int intraBw = 0; intraBw < S; ++intraBw) {
+        for (int cc = 0; cc < C; cc++) {
+            int hh = h0 + intraBh;
+            int ww = w0 + intraBw;
+            scalar_t readVal = 0.0f;
+            if (hh >= 0 && ww >= 0 && hh < H && ww < W)
+                readVal = x[biN*H*W*C + hh*W*C + ww*C + cc];
+            if (transpose) // output to gathered blocks in NCHW
+                y[ib*R*S*C + cc*R*S + intraBh*S + intraBw] = readVal;
+            else
+                y[ib*R*S*C + intraBh*S*C + intraBw*C + cc] = readVal;
+        } } }
+    }
+}
+
+// CPU specialization of actual computation.
+// This is a naive CPU implementation, just for testing purpose.
+template <typename scalar_t>
+void SparseScatterCPU(
+		const scalar_t* x, int N, int H, int W, int C, scalar_t* y,
+		int bOffsH0, int bOffsW0, int bSzH, int bSzW, int bStrH, int bStrW,
+		int numActive, const int16_t* activeBlockIndices, bool add, bool transpose, bool atomic)
+{
+    omp_lock_t writeLock;
+    omp_init_lock(&writeLock);
+
+    const int R = bSzH, S = bSzW;
+    #pragma omp parallel for
+    for (int ib = 0; ib < numActive; ib++) {
+        int biN = activeBlockIndices[ib*3+0];
+        int biH = activeBlockIndices[ib*3+1];
+        int biW = activeBlockIndices[ib*3+2];
+        for (int intraBh = 0; intraBh < R; ++intraBh) {
+        for (int intraBw = 0; intraBw < S; ++intraBw) {
+        for (int cc = 0; cc < C; cc++) {
+            int h0 = bOffsH0 + biH * bStrH;
+            int w0 = bOffsW0 + biW * bStrW;
+            int hh = h0 + intraBh;
+            int ww = w0 + intraBw;
+            scalar_t readVal;
+            if (transpose)
+                readVal = x[ib*R*S*C + cc*R*S + intraBh*S + intraBw];
+            else
+                readVal = x[ib*R*S*C + intraBh*S*C + intraBw*C + cc];
+            if (hh >= 0 && ww >= 0 && hh < H && ww < W) {
+                if (add) {
+                    omp_set_lock(&writeLock);
+                    y[biN * H * W * C + hh * W * C + ww * C + cc] += readVal;
+                    omp_unset_lock(&writeLock);
+                } else
+                    y[biN*H*W*C + hh*W*C + ww*C + cc] = readVal;
+            }
+        } } }
+    }
+}
+
+torch::Tensor SparseGather(torch::Tensor x,
+		torch::Tensor bin_counts_tensor,
+		torch::Tensor activeBlockIndices,
+		std::pair<int,int> bsize_dynamic,
+		std::pair<int,int> bstride_dynamic,
+		std::pair<int,int> boffset_dynamic,
+		bool transpose_)
+{
+	int bSzH = bsize_dynamic.first;
+	int bSzW = bsize_dynamic.second;
+	int bStrH = bstride_dynamic.first;
+	int bStrW = bstride_dynamic.second;
+	int bOffsH0 = boffset_dynamic.first;
+	int bOffsW0 = boffset_dynamic.second;
+
+	// Grabs input shape.
+	// BE CAREFUL, THE SHAPE IS NHWC !!!
+	// TODO
+	int N = x.size(0);
+	int H = x.size(1);
+	int W = x.size(2);
+	int C = x.size(3);
+
+	//const Tensor& bin_counts_tensor = context->input(1);
+	// read the number of active blocks from bin_counts input that is expected to be always in host mem
+	// This could be in GPU MEM!
+	int32_t bin0Count = bin_counts_tensor[0].item<int32_t>();
+
+	// Initializes output.
+	std::vector<int64_t> yShapeArr{ bin0Count, bSzH, bSzW, C };
+	if (transpose_)
+	{
+		// output is NCHW for tranposed version
+		yShapeArr[1] = C;
+		yShapeArr[2] = bSzH;
+		yShapeArr[3] = bSzW;
+	}
+	auto x_device = x.device().type();
+	auto tensor_options = torch::TensorOptions()
+		.layout(torch::kStrided)
+		.dtype(x.scalar_type())
+		.device(x_device)
+		.requires_grad(false);
+	torch::Tensor y = torch::empty(yShapeArr, tensor_options);
+
+	if (x_device == torch::kCPU){
+		AT_DISPATCH_ALL_TYPES(x.scalar_type(), "ReduceMaskCPU", ([&] {
+			SparseGatherCPU<scalar_t>(
+				x.data_ptr<scalar_t>(), N, H, W, C,
+				y.data_ptr<scalar_t>(),
+				bOffsH0, bOffsW0, bSzH, bSzW, bStrH, bStrW,
+				bin0Count, activeBlockIndices.data_ptr<int16_t>(),
+				transpose_);
+		}));
+	}
+	else{
+		// TODO Call GPU equivalent
+		// ...
+	}
+
+	return y;	
+}
+
+torch::Tensor SparseScatter(torch::Tensor x,
+		torch::Tensor bin_counts_tensor,
+		torch::Tensor activeBlockIndices,
+		torch::Tensor ybase, // This was the input of gather, now it becomes output
+		std::pair<int,int> bsize_dynamic,
+		std::pair<int,int> bstride_dynamic,
+		std::pair<int,int> boffset_dynamic,
+		bool transpose_,
+		bool add_,
+		bool atomic_)
+{
+
+		// TODO IS NHWC OK?
+        int N = ybase.size(0);
+        int H = ybase.size(1);
+        int W = ybase.size(2);
+        int C = ybase.size(3);
+
+		int bSzH = bsize_dynamic.first;
+		int bSzW = bsize_dynamic.second;
+		int bStrH = bstride_dynamic.first;
+		int bStrW = bstride_dynamic.second;
+		int bOffsH0 = boffset_dynamic.first;
+		int bOffsW0 = boffset_dynamic.second;
+
+        if (!atomic_ && add_) {
+			// TODO PRINT SOME ERROR
+        }
+        
+		// read the number of active blocks from bin_counts input that is expected to be always in host mem
+		int32_t bin0Count = bin_counts_tensor[0].item<int32_t>();
+
+        // Splat/add x on top of y
+		// We have ybase allocated, use it as output
+		auto x_device = x.device().type();
+		if (x_device == torch::kCPU){
+			AT_DISPATCH_ALL_TYPES(x.scalar_type(), "ReduceMaskCPU", ([&] {
+				SparseScatterCPU(
+					x.data_ptr<scalar_t>(), N, H, W, C,
+					ybase.data_ptr<scalar_t>(),
+					bOffsH0, bOffsW0, bSzH, bSzW, bStrH, bStrW,
+					bin0Count, activeBlockIndices.data_ptr<int16_t>(),
+					add_, transpose_, atomic_
+				);
+			}));
+		}
+		else{
+			// TODO Call GPU Equivalent
+			// ...
+		}
+
+		return ybase;
+}
+
