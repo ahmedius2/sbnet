@@ -29,8 +29,9 @@ from torch.utils.cpp_extension import load
 sbnet_path = '/root/sbnet/sbnet_pytorch/sbnet_ops'
 sbnet= load(
     'sbnet', [
-		sbnet_path + '/reduce_mask.cpp',
 		sbnet_path + '/reduce_mask_cuda.cu',
+		sbnet_path + '/reduce_mask.cpp',
+		sbnet_path + '/sparse_gather.cu',
 		sbnet_path + '/sparse_gather.cpp',
 		sbnet_path + '/pybind_modules.cpp',
 	],
@@ -56,6 +57,7 @@ outBlockParams = { "bsize": [blockSize[0]-2, blockSize[1]-2], "boffset": blockOf
 # create a random mask representing attention/a priori sparsity
 # threshold the mask to a specified percentile sparsity
 mask = np.random.randn(batch, blockCount[0], blockCount[1], channels).astype(np.float32)
+mask = torch.from_numpy(mask).contiguous().cuda()
 #threshold = np.percentile(mask, 90)
 #sparseMask = np.greater(mask, threshold).astype(np.float32)
 
@@ -64,18 +66,17 @@ mask = np.random.randn(batch, blockCount[0], blockCount[1], channels).astype(np.
 
 # create a random input tensor
 x = torch.from_numpy( np.random.randn(batch, hw, hw, channels).astype(np.float32) )
-x = x.contiguous()
+x = x.contiguous().cuda()
 
 # create a random weight tensor
 w = torch.from_numpy( np.random.randn(channels, channels, 3, 3).astype(np.float32) )
-w = w.contiguous()
+w = w.contiguous().cuda()
 
 # reduce the mask to indices by using a fused pooling+indexing operation
-mask = torch.from_numpy(mask)
 #counts2, indices2 = sbnet.reduce_mask(mask.cuda(), blockCount, **inBlockParams, avgpool=True, tol=0.05)
 counts1, indices1 = sbnet.reduce_mask(mask, blockCount, **inBlockParams, avgpool=True, tol=0.05)
-print('counts:', int(counts1[0]))
-print('indices size:', indices1.size())
+print('counts:', int(counts1[0]), counts1.device)
+print('indices size:', indices1.size(), indices1.device)
 #	indices1=indices1[:counts1[0]]
 #	indices2=indices2[:counts2[0]]
 #	if not torch.equal(counts1, counts2.cpu()) or \
@@ -87,33 +88,29 @@ print('indices size:', indices1.size())
 #		print('indices2', indices2.size(), indices2)
 
 
-print('x size:', x.size())
+print('x size:', x.size(), x.device)
 # stack active overlapping tiles to batch dimension
 blockStack = sbnet.sparse_gather(
     x, counts1, indices1, transpose=True, **inBlockParams)
 
-print('blockStack size:', blockStack.size())
+print('blockStack:', blockStack.size(), blockStack.device)
 
 # perform dense convolution on a sparse stack of tiles
-convBlocks = torch.nn.functional.conv2d(blockStack, w, padding='valid')
 # write/scatter the tiles back on top of original tensor
 # note that the output tensor is reduced by 1 on each side due to 'VALID' convolution
+convBlocks = torch.nn.functional.conv2d(blockStack, w, padding='same')
+y = sbnet.sparse_scatter(
+    convBlocks, counts1, indices1,
+    x, **inBlockParams, transpose=True, add=False, atomic=False)
+print('y1 size:', y.size(), y.device)
+
+
+convBlocks = torch.nn.functional.conv2d(blockStack, w, padding='valid')
 validX = x[:, 1:hw-1, 1:hw-1, :]
 y = sbnet.sparse_scatter(
     convBlocks, counts1, indices1,
     validX, **outBlockParams, transpose=True, add=False, atomic=False)
-print('y1 size:', y.size())
-
-# perform dense convolution on a sparse stack of tiles
-convBlocks = torch.nn.functional.conv2d(blockStack, w, padding='same')
-# write/scatter the tiles back on top of original tensor
-# note that the output tensor is reduced by 1 on each side due to 'VALID' convolution
-y = sbnet.sparse_scatter(
-    convBlocks, counts1, indices1,
-    x, **inBlockParams, transpose=True, add=False, atomic=False)
-print('y2 size:', y.size())
-
-
+print('y2 size:', y.size(), y.device)
 
 sys.exit()
 

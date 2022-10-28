@@ -26,10 +26,17 @@
 #include <omp.h>
 #include <vector>
 
-//#include <cuda_runtime.h>
+torch::Tensor LaunchSparseGatherGPU(
+        torch::Tensor x, int N, int H, int W, int C,
+        torch::Tensor y,
+        int bOffsH0, int bOffsW0, int bSzH, int bSzW, int bStrH, int bStrW,
+        int numActive, torch::Tensor activeBlockIndices, bool transpose);
 
-//#include "op_utils.h"
-//#include "sparse_gather.h"
+torch::Tensor LaunchSparseScatterGPU(
+        torch::Tensor x, int N, int H, int W, int C, torch::Tensor y,
+        int bOffsH0, int bOffsW0, int bSzH, int bSzW, int bStrH, int bStrW,
+        int numActive, torch::Tensor activeBlockIndices, bool add,
+		bool transpose, bool atomic);
 
 // CPU specialization of actual computation.
 // This is a naive CPU implementation, just for testing purpose.
@@ -121,7 +128,6 @@ torch::Tensor SparseGather(torch::Tensor x,
 
 	// Grabs input shape.
 	// BE CAREFUL, THE SHAPE IS NHWC !!!
-	// TODO
 	int N = x.size(0);
 	int H = x.size(1);
 	int W = x.size(2);
@@ -150,7 +156,7 @@ torch::Tensor SparseGather(torch::Tensor x,
 	torch::Tensor y = torch::empty(yShapeArr, tensor_options);
 
 	if (x_device == torch::kCPU){
-		AT_DISPATCH_ALL_TYPES(x.scalar_type(), "ReduceMaskCPU", ([&] {
+		AT_DISPATCH_FLOATING_TYPES(x.scalar_type(), "SparseGatherCPU", ([&] {
 			SparseGatherCPU<scalar_t>(
 				x.data_ptr<scalar_t>(), N, H, W, C,
 				y.data_ptr<scalar_t>(),
@@ -160,8 +166,9 @@ torch::Tensor SparseGather(torch::Tensor x,
 		}));
 	}
 	else{
-		// TODO Call GPU equivalent
-		// ...
+		y = LaunchSparseGatherGPU(
+			x, N, H, W, C, y, bOffsH0, bOffsW0, bSzH, bSzW, bStrH, bStrW,
+			bin0Count, activeBlockIndices,transpose_);
 	}
 
 	return y;	
@@ -203,10 +210,9 @@ torch::Tensor SparseScatter(torch::Tensor x,
 		// We have ybase allocated, use it as output
 		auto x_device = x.device().type();
 		if (x_device == torch::kCPU){
-			AT_DISPATCH_ALL_TYPES(x.scalar_type(), "ReduceMaskCPU", ([&] {
+			AT_DISPATCH_FLOATING_TYPES(x.scalar_type(), "SparseScatterCPU", ([&] {
 				SparseScatterCPU(
-					x.data_ptr<scalar_t>(), N, H, W, C,
-					ybase.data_ptr<scalar_t>(),
+					x.data_ptr<scalar_t>(), N, H, W, C, ybase.data_ptr<scalar_t>(),
 					bOffsH0, bOffsW0, bSzH, bSzW, bStrH, bStrW,
 					bin0Count, activeBlockIndices.data_ptr<int16_t>(),
 					add_, transpose_, atomic_
@@ -214,8 +220,9 @@ torch::Tensor SparseScatter(torch::Tensor x,
 			}));
 		}
 		else{
-			// TODO Call GPU Equivalent
-			// ...
+			ybase = LaunchSparseScatterGPU(x, N, H, W, C, ybase,
+					bOffsH0, bOffsW0, bSzH, bSzW, bStrH, bStrW,
+					bin0Count, activeBlockIndices, add_, transpose_, atomic_);
 		}
 
 		return ybase;

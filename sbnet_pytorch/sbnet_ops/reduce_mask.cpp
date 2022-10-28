@@ -139,7 +139,7 @@ std::pair<torch::Tensor, torch::Tensor> ReduceMask(torch::Tensor mask,
 
 	if (mask_device == torch::kCPU){
 		assert(numBins == 1);
-		AT_DISPATCH_ALL_TYPES(mask.scalar_type(), "ReduceMaskCPU", ([&] {
+		AT_DISPATCH_FLOATING_TYPES(mask.scalar_type(), "ReduceMaskCPU", ([&] {
 			ReduceMaskCPU<scalar_t>(
 					mask.data_ptr<scalar_t>(),                // Mask array.
 					N,                                        // Batch dimension of the mask.

@@ -248,7 +248,7 @@ void LaunchReduceMaskGPU(
 	cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 	gpuErrorCheck( cudaPeekAtLastError() );
 
-	AT_DISPATCH_ALL_TYPES(mask.scalar_type(), "ReduceMaskGPU", ([&] {
+	AT_DISPATCH_FLOATING_TYPES(mask.scalar_type(), "ReduceMaskGPU", ([&] {
 		zeroBlockCounters<<<1, 32, 0, stream>>>(numBins, binCounts.data_ptr<int32_t>());
 		gpuErrorCheck( cudaPeekAtLastError() );
 
