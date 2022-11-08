@@ -17,11 +17,16 @@
 
 */
 
+/*
+From GitHub page:
+
+Current code is not tuned for performance with non-square block sizes and has specialized implementations for a specific list of block sizes. This includes square blocks of sizes 1 to 34 and a few others. To achieve maximum performance for these sizes you would need to add your custom template instantiations by modifying SIZE_TEMPLATES macro in sparse_gather.cu
+*/
+
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 
 #include <cuda_runtime.h>
-//#include "sparse_gather.h"
 #include "sparse_blocks.cu.h"
 #include "cuda_helpers.h"
 #include "op_utils.h"
@@ -29,7 +34,6 @@
 #define COMPUTE_R1(RR) ((RR) < 7 ? ((RR) == 1 ? 1 : 2) : 4)
 
 namespace {
-// TODO USE scalar_t here as well!!!!
 template<typename scalar_t>
 struct LaunchParams {
     dim3 block, grid;
@@ -52,12 +56,6 @@ struct LaunchParams {
 }
 
 // Define the GPU implementation that launches the CUDA kernel.
-//        const T* x, int N, int H, int W, int C,
-//        T* y,
-//        int bOffsH0, int bOffsW0, int bSzH, int bSzW, int bStrH, int bStrW,
-//        int numActive, const short* activeBlockIndices, bool transpose
-//    )
-
 torch::Tensor LaunchSparseGatherGPU(
         torch::Tensor x, int N, int H, int W, int C, torch::Tensor y,
         int bOffsH0, int bOffsW0, int bSzH, int bSzW, int bStrH, int bStrW,

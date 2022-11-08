@@ -26,17 +26,17 @@ import numpy as np
 import sys
 
 from torch.utils.cpp_extension import load
-sbnet_path = '/root/sbnet/sbnet_pytorch/sbnet_ops'
-sbnet= load(
-    'sbnet', [
-		sbnet_path + '/reduce_mask_cuda.cu',
-		sbnet_path + '/reduce_mask.cpp',
-		sbnet_path + '/sparse_gather.cu',
-		sbnet_path + '/sparse_gather.cpp',
-		sbnet_path + '/pybind_modules.cpp',
+sbnet_module_path = '/root/sbnet/sbnet_pytorch/sbnet_ops'
+sbnet_module= load(
+    'sbnet_module', [
+		sbnet_module_path + '/reduce_mask_cuda.cu',
+		sbnet_module_path + '/reduce_mask.cpp',
+		sbnet_module_path + '/sparse_gather_cuda.cu',
+		sbnet_module_path + '/sparse_gather.cpp',
+		sbnet_module_path + '/pybind_modules.cpp',
 	],
 	verbose=True)
-#help(sbnet)
+#help(sbnet_module)
 
 def divup(a, b):
     return (a+b-1) // b
@@ -73,8 +73,8 @@ w = torch.from_numpy( np.random.randn(channels, channels, 3, 3).astype(np.float3
 w = w.contiguous().cuda()
 
 # reduce the mask to indices by using a fused pooling+indexing operation
-#counts2, indices2 = sbnet.reduce_mask(mask.cuda(), blockCount, **inBlockParams, avgpool=True, tol=0.05)
-counts1, indices1 = sbnet.reduce_mask(mask, blockCount, **inBlockParams, avgpool=True, tol=0.05)
+#counts2, indices2 = sbnet_module.reduce_mask(mask.cuda(), blockCount, **inBlockParams, avgpool=True, tol=0.05)
+counts1, indices1 = sbnet_module.reduce_mask(mask, blockCount, **inBlockParams, avgpool=True, tol=0.05)
 print('counts:', int(counts1[0]), counts1.device)
 print('indices size:', indices1.size(), indices1.device)
 #	indices1=indices1[:counts1[0]]
@@ -90,7 +90,7 @@ print('indices size:', indices1.size(), indices1.device)
 
 print('x size:', x.size(), x.device)
 # stack active overlapping tiles to batch dimension
-blockStack = sbnet.sparse_gather(
+blockStack = sbnet_module.sparse_gather(
     x, counts1, indices1, transpose=True, **inBlockParams)
 
 print('blockStack:', blockStack.size(), blockStack.device)
@@ -99,7 +99,7 @@ print('blockStack:', blockStack.size(), blockStack.device)
 # write/scatter the tiles back on top of original tensor
 # note that the output tensor is reduced by 1 on each side due to 'VALID' convolution
 convBlocks = torch.nn.functional.conv2d(blockStack, w, padding='same')
-y = sbnet.sparse_scatter(
+y = sbnet_module.sparse_scatter(
     convBlocks, counts1, indices1,
     x, **inBlockParams, transpose=True, add=False, atomic=False)
 print('y1 size:', y.size(), y.device)
@@ -107,7 +107,7 @@ print('y1 size:', y.size(), y.device)
 
 convBlocks = torch.nn.functional.conv2d(blockStack, w, padding='valid')
 validX = x[:, 1:hw-1, 1:hw-1, :]
-y = sbnet.sparse_scatter(
+y = sbnet_module.sparse_scatter(
     convBlocks, counts1, indices1,
     validX, **outBlockParams, transpose=True, add=False, atomic=False)
 print('y2 size:', y.size(), y.device)
