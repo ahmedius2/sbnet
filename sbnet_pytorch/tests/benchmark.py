@@ -1,35 +1,58 @@
 import time
-from sparse_conv_lib_torch import *
+from sbnet.layers import *
+import sys
+
+class Conv2d_BN_ReLU(torch.nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding='valid', 
+            bias=True):
+        super(Conv2d_BN_ReLU, self).__init__()
+
+        self.conv_bn_relu = torch.nn.Sequential(
+            torch.nn.Conv2d(in_channels, out_channels, kernel_size,
+                stride=stride, padding=padding, bias=bias),
+            torch.nn.BatchNorm2d(out_channels, eps=1e-3, momentum=0.01),
+            torch.nn.ReLU()
+        )
+
+    def forward(self, x):
+        return self.conv_bn_relu(x)
+
+def run_benchmark(func, args, name):
+    print('Input  size:', args[0].size())
+    with torch.no_grad():
+        y_ = func(*args)
+    print('Output size:', y_.size())
+
+    # Benchmark it
+    torch.cuda.synchronize()
+    t1 = time.time()
+    num_samples = 100
+    with torch.no_grad():
+        for i in range(num_samples):
+            y_ = func(*args)
+    torch.cuda.synchronize()
+    t2 = time.time()
+    tdiff = (t2-t1) * 1000.0 / num_samples
+    print(f'Avrg {name} time: {tdiff} ms')
+    return tdiff
 
 N, C, H, W = 1, 64, 256, 256
 x = torch.rand((N, H, W, C)).cuda()
 C_out, C_in, kH, kW = 64, 64, 3, 3
 w = torch.rand((C_out, C_in, kH, kW)).cuda()
-#bsize, strides, padding = [1, 17, 17, 1], [1, 2, 2, 1], 'valid'
-bsize, strides, padding = [1, 32, 32, 1], [1, 1, 1, 1], 'same'
+#bsize, strides, padding = [1, 17, 17, 1], [1, 1, 1, 1], 'valid'
+bsize, strides, padding = [1, 15, 15, 1], [1, 2, 2, 1], 'valid'
+#bsize, strides, padding = [1, 32, 32, 1], [1, 1, 1, 1], 'same'
 
 ##################################
 # Regular convolution benchmark
 ##################################
 cbnr = Conv2d_BN_ReLU(C_in, C_out, kH, strides[1], padding, bias=False).cuda()
+
 x_ = x.permute(0, 3, 1, 2).contiguous()
-
 # invoke cudnn benchmark initially
-with torch.no_grad():
-    y_ = cbnr(x_)
-
-# Benchmark it
-torch.cuda.synchronize()
-t1 = time.time()
-with torch.no_grad():
-    for i in range(100):
-        y_ = cbnr(x_)
-        #y_ = torch.nn.functional.conv2d(x_, w, None, strides[1:3], padding)
-torch.cuda.synchronize()
-t2 = time.time()
-print(f'Avrg regular conv time: {(t2-t1)*1000.0/100.0} ms')
+run_benchmark(cbnr, (x_,), 'regular convolution')
 ##################################
-
 
 
 ########################################
@@ -65,18 +88,9 @@ rm = ReduceMask(inds, counts)
 conv_times = []
 for c in range(1,max_num_blocks+1):
     # invoke cudnn benchmark initially
-    with torch.no_grad():
-        y = sb_cbnr(x, rm, atomic=False, block_params=block_params)
+    tdiff = run_benchmark(sb_cbnr, (x, rm, False, block_params), 
+            f'sparse conv for {rm.bin_counts[0]} blocks')
 
-    torch.cuda.synchronize()
-    t1 = time.time()
-    for i in range(100):
-        with torch.no_grad():
-            y = sb_cbnr(x, rm, atomic=False, block_params=block_params)
-    torch.cuda.synchronize()
-    t2 = time.time()
-    tdiff= (t2-t1)*1000.0/100.0
-    print(f'Avrg conv time for {rm.bin_counts[0]} blocks: {tdiff} ms')
     conv_times.append({'num_blocks': c, 'time_ms': round(tdiff,3)})
     rm.bin_counts[0] += 1
 

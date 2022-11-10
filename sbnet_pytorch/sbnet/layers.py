@@ -1,9 +1,9 @@
 import torch
-import sbnet_module
 import numpy as np
 from collections import namedtuple
-from torch_conv_dims import calc_padding_4d, calc_out_size_4d, calc_out_size_4d_np
-
+from sbnet.conv_dims import calc_padding_4d, calc_out_size_4d, calc_out_size_4d_np
+import sbnet.ops
+from math import floor
 BlockParams = namedtuple('BlockParams', ['bsize', 'bsize_out', 'boffset', 'bcount', 'bstrides'])
 ReduceMask = namedtuple('ReduceMask', ['active_block_indices', 'bin_counts'])
 
@@ -18,8 +18,6 @@ def _calc_block_strides(bsize, ksize, strides):
     """
     return [1, bsize[1] - ksize[0] + strides[1], bsize[2] - ksize[1] + strides[2], 1]
 
-#example bsize: [1, 16, 16, 1], ksize: [3, 3, in_C, out_C], strides: [1, 1, 1, 1], padding: 'same'
-#example bsize: [1, 17, 17, 1], ksize: [3, 3, in_C, out_C], strides: [1, 2, 2, 1], padding: 'same'
 def calc_block_params(in_size, bsize, ksize, strides, padding):
     """
     Calculates block parameters for a single convolution layer.
@@ -105,7 +103,7 @@ def convert_mask_to_indices(mask, block_params, tol, avgpool=False):
         else:
             return torch.tensor(a, dtype=dtype)
 
-    counts, indices = sbnet_module.reduce_mask(
+    counts, indices = sbnet.ops.reduce_mask(
         mask,
         block_params.bcount,
         bsize=block_params.bsize,
@@ -126,7 +124,7 @@ def sparse_conv2d(x,
          atomic=False):
     assert transpose, 'Only available when transpose is True'
     # TODO calc ksize
-    p = sbnet_module.sparse_gather(
+    p = sbnet.ops.sparse_gather(
         x,
         indices.bin_counts,
         indices.active_block_indices,
@@ -143,7 +141,7 @@ def sparse_conv2d(x,
         x = torch.empty((x.size(0), x.size(1)//strides[1], x.size(2)//strides[2], x.size(3)),
                 device=x.device)
 
-    y = sbnet_module.sparse_scatter(
+    y = sbnet.ops.sparse_scatter(
         q,
         indices.bin_counts,
         indices.active_block_indices,
@@ -157,30 +155,20 @@ def sparse_conv2d(x,
 
     return y
 
-class Conv2d_BN_ReLU(torch.nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, 
-            bias=True):
-        super(Conv2d_BN_ReLU, self).__init__()
-
-        self.conv_bn_relu = torch.nn.Sequential(
-            torch.nn.Conv2d(in_channels, out_channels, kernel_size,
-                stride=stride, padding=padding, bias=bias),
-            torch.nn.BatchNorm2d(out_channels, eps=1e-3, momentum=0.01),
-            torch.nn.ReLU()
-        )
-
-    def forward(self, x):
-        return self.conv_bn_relu(x)
-
 class SparseBlock_Conv2d_BN_ReLU(torch.nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, 
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding='valid', 
             bias=True):
         super(SparseBlock_Conv2d_BN_ReLU, self).__init__()
 
+        assert (padding == 'same' and stride == 1) or padding == 'valid'
+        self.kernel_size = kernel_size
         self.stride = stride
-        self.conv_bn_relu = torch.nn.Sequential( 
+        self.padding = padding
+        self.conv_bn_relu = torch.nn.Sequential(
+            # The convolution here will be always without padding.
+            # If needed, padding will be done by sparse gather.
             torch.nn.Conv2d(in_channels, out_channels, kernel_size,
-                stride=stride, padding=padding, bias=bias),
+                stride=stride, padding=0, bias=bias),
             torch.nn.BatchNorm2d(out_channels, eps=1e-3, momentum=0.01),
             torch.nn.ReLU()
         )
@@ -188,10 +176,14 @@ class SparseBlock_Conv2d_BN_ReLU(torch.nn.Module):
         # Computing this requires knowing the input size
         self.block_params=None
 
+    def init_block_params(self):
+        pass
+
     def forward(self, x, indices, atomic=False, block_params=None):
         bp = self.block_params if block_params is None else block_params
-        
-        p = sbnet_module.sparse_gather(
+        assert bp is not None, 'Block parameters should either be initalized or given'
+
+        p = sbnet.ops.sparse_gather(
             x,
             indices.bin_counts,
             indices.active_block_indices,
@@ -203,16 +195,22 @@ class SparseBlock_Conv2d_BN_ReLU(torch.nn.Module):
         # Convolution on patches.
         q = self.conv_bn_relu(p)
 
-        # Allocate output tensor if stride > 1, otherwise use input as output
-        if self.stride > 1:
-            x = torch.empty((x.size(0), x.size(1)//self.stride, x.size(2)//self.stride, x.size(3)),
-                    device=x.device)
+        # Allocate output tensor
+        # Assumes dilation is 1
+        outp_sz = list(x.size())
+        if self.padding == 'valid':
+            ksz = self.kernel_size
+            outp_sz = [outp_sz[0],
+                    floor(float(outp_sz[1] - (ksz-1) - 1) / self.stride + 1),
+                    floor(float(outp_sz[2] - (ksz-1) - 1) / self.stride + 1),
+                    outp_sz[3]]
+        out = torch.empty(outp_sz, device=x.device)
 
-        y = sbnet_module.sparse_scatter(
+        y = sbnet.ops.sparse_scatter(
             q,
             indices.bin_counts,
             indices.active_block_indices,
-            x,
+            out,
             bsize=bp.bsize_out,
             bstride=bp.bstrides,
             boffset=(0, 0), # why 0 0?, 
