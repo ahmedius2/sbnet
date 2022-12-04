@@ -1,6 +1,8 @@
 import time
-from sbnet.layers import *
 import sys
+import torch
+from sbnet.layers import BlockParams, ReduceMask, \
+        SparseBlock_Conv2d_BN_ReLU, gen_full_reducemask
 
 class Conv2d_BN_ReLU(torch.nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding='valid', 
@@ -36,63 +38,33 @@ def run_benchmark(func, args, name):
     print(f'Avrg {name} time: {tdiff} ms')
     return tdiff
 
-N, C, H, W = 1, 64, 256, 256
+N, C, H, W = 1, 128, 256, 256
 x = torch.rand((N, H, W, C)).cuda()
-C_out, C_in, kH, kW = 64, 64, 3, 3
-w = torch.rand((C_out, C_in, kH, kW)).cuda()
-#bsize, strides, padding = [1, 17, 17, 1], [1, 1, 1, 1], 'valid'
-bsize, strides, padding = [1, 15, 15, 1], [1, 2, 2, 1], 'valid'
-#bsize, strides, padding = [1, 32, 32, 1], [1, 1, 1, 1], 'same'
+C_out, C_in, ksize, stride = 128, C, 3, 1
 
 ##################################
 # Regular convolution benchmark
 ##################################
-cbnr = Conv2d_BN_ReLU(C_in, C_out, kH, strides[1], padding, bias=False).cuda()
+cbnr = Conv2d_BN_ReLU(C_in, C_out, ksize, stride, 'same', bias=False).cuda()
 
 x_ = x.permute(0, 3, 1, 2).contiguous()
-# invoke cudnn benchmark initially
 run_benchmark(cbnr, (x_,), 'regular convolution')
 ##################################
-
 
 ########################################
 # Sparse block convolution benchmark
 ########################################
-flipped_wsize = list(w.size())[::-1]
-block_params = calc_block_params(list(x.size()), bsize, flipped_wsize, strides, padding)
-print('block_params:', block_params)
-
-##################################
-# Actual reduce mask generation
-#mask = torch.rand((N, block_params.bcount[0], block_params.bcount[1], 1)).cuda()
-#tol, avgpool = 0.05, True
-#rm = convert_mask_to_indices(mask, block_params, tol, avgpool)
-#print('reduce mask:', rm)
-##################################
-
-sb_cbnr = SparseBlock_Conv2d_BN_ReLU(C_in, C_out, kH, strides[1], padding, bias=False).cuda()
-
-##################################
-# Synthetic reduce mask generation
-max_num_blocks= block_params.bcount[0] * block_params.bcount[1]
-inds = torch.empty((max_num_blocks, 3), dtype=torch.int16)
-for i in range(block_params.bcount[0]):
-    for j in range(block_params.bcount[1]):
-        inds[i * block_params.bcount[1] + j] = torch.tensor((0, i, j), dtype=torch.int16)
-#print('inds', inds)
-inds = inds.cuda()
-counts = torch.ones(1, dtype=torch.int32)
-rm = ReduceMask(inds, counts)
-##################################
-
+sb_cbnr = SparseBlock_Conv2d_BN_ReLU(C_in, C_out, ksize, stride, bias=False).cuda()
+bcount = [16, 16]
+sb_cbnr.calibration(x, bcount)
+rm = gen_full_reducemask(bcount)
 conv_times = []
-for c in range(1,max_num_blocks+1):
-    # invoke cudnn benchmark initially
-    tdiff = run_benchmark(sb_cbnr, (x, rm, False, block_params), 
+for c in range(1, bcount[0]*bcount[1]+1):
+    rm.bin_counts[0] = c
+    tdiff = run_benchmark(sb_cbnr, (x, rm, False), 
             f'sparse conv for {rm.bin_counts[0]} blocks')
 
     conv_times.append({'num_blocks': c, 'time_ms': round(tdiff,3)})
-    rm.bin_counts[0] += 1
 
 import csv
 with open('timing_stats.csv', 'w', newline='') as csvfile:

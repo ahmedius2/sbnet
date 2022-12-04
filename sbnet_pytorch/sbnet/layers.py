@@ -1,192 +1,113 @@
 import torch
 import numpy as np
 from collections import namedtuple
-from sbnet.conv_dims import calc_padding_4d, calc_out_size_4d, calc_out_size_4d_np
 import sbnet.ops
 from math import floor
 BlockParams = namedtuple('BlockParams', ['bsize', 'bsize_out', 'boffset', 'bcount', 'bstrides'])
 ReduceMask = namedtuple('ReduceMask', ['active_block_indices', 'bin_counts'])
 
-def _calc_block_strides(bsize, ksize, strides):
-    """Calculates strides for blocks.
+# if this returns an integer, it is successful
+def bsize_1d(bcount, insize, ksize, stride):
+    bsize = (insize - ksize + stride) / bcount + ksize - stride
+    return bsize
 
-    :param bsize:     [list]        List of 4 int. Size of blocks, or downsample ratio.
-    :param ksize:     [list]        List of 4 int. Sparse convolution kernel size.
-    :param strides:   [list]        List of 4 int. Sparse convolution strides.
+def calc_block_params_and_padding_1d(bcount, insize, ksize, stride):
+    pad = bcount-((insize - ksize + stride) % bcount)
+    # This can decrease accuracy as it makes
+    # the edges undetectible, but I believe it should be okay
+    #pad = -((insize - ksize + stride) % bcount)
+    bsize = bsize_1d(bcount, insize + pad, ksize, stride)
+    while (bsize - ksize) % stride != 0:
+        pad += bcount
+        bsize = bsize_1d(bcount, insize + pad, ksize, stride)
+    assert bsize.is_integer()
+    bsize = int(bsize)
+    bsize_out = int((bsize-ksize)/stride+1)
+    boffset=0
+    bstride =  bsize - ksize + stride
+    return (bsize, bsize_out, boffset, bcount, bstride, pad)
 
-    :return           [list]        List of 4 int. Block strides.
-    """
-    return [1, bsize[1] - ksize[0] + strides[1], bsize[2] - ksize[1] + strides[2], 1]
+# Don't worry about this too much, we can pad the output
+# if the output size is not the desired one.
+def calc_out_size(bcount, bsize, ksize, stride):
+    out_size = ((bsize-ksize)/stride+1)
+    assert out_size.is_integer()
+    return int(bcount * out_size)
 
-def calc_block_params(in_size, bsize, ksize, strides, padding):
-    """
-    Calculates block parameters for a single convolution layer.
+def gen_full_reducemask(bcount):
+    max_num_blocks= bcount[0] * bcount[1]
+    inds = torch.empty((max_num_blocks, 3), dtype=torch.int16)
+    for i in range(bcount[0]):
+        for j in range(bcount[1]):
+            inds[i * bcount[1] + j] = torch.tensor((0, i, j), dtype=torch.int16)
+    #print('inds', inds)
+    inds = inds.cuda()
+    counts = torch.full((1,), max_num_blocks, dtype=torch.int32)
+    return ReduceMask(inds, counts)
 
-    :param in_size:  [list]     List of 4 int, or a Tensor of size 4. Size of the convolution input.
-    :param bsize:    [list]     List of 4 int. Size of blocks, or downsample ratio.
-    :param ksize:    [list]     List of 4 int. Sparse convolution kernel size.
-    :param strides:  [list]     List of 4 int. Sparse convolution stride size.
-                                Currently only supports when,
-                                1) (bsize[1] - ksize[0]) % strides[1] == 0 and,
-                                2) (bsize[2] - ksize[1]) % strides[2] == 0
-    :param padding:  [string]   `valid` or `same`, padding method for sparse convolution.
-
-    :return          [tuple]
-        bsize:
-        bsize_out:
-        boffset:
-        bcount:
-        bstrides:
-    """
-    static = not torch.is_tensor(in_size)
-
-    assert ((bsize[1] - ksize[0]) % strides[1] == 0)
-    assert ((bsize[2] - ksize[1]) % strides[2] == 0)
-
-    bstrides = _calc_block_strides(bsize, ksize, strides)
-    pad_h0, pad_h1, pad_w0, pad_w1 = calc_padding_4d(in_size, ksize, strides, padding)
-    h = in_size[1]
-    w = in_size[2]
-    # Make padding divides blocks.
-    pad_h1 += (-h + bsize[1]) % bstrides[1]
-    pad_w1 += (-w + bsize[2]) % bstrides[2]
-    boffset = [-pad_h0, -pad_w0]
-    x_pad_shape = [
-        in_size[0], in_size[1] + pad_h0 + pad_h1, in_size[2] + pad_w0 + pad_w1, in_size[3]
-    ]
-    if static:
-        out_shape = calc_out_size_4d_np(x_pad_shape, [bsize[1], bsize[2], 1, 1], bstrides, 'valid')
-    else:
-        out_shape = calc_out_size_4d(x_pad_shape, [bsize[1], bsize[2], 1, 1], bstrides, 'valid')
-    bcount = [out_shape[1], out_shape[2]]
-    bsize_out = calc_out_size_4d_np(bsize, ksize, strides, 'valid')
-    bsize = bsize[1:3]
-    bstrides = bstrides[1:3]
-    bsize_out = bsize_out[1:3]
-    if static:
-        assert (pad_h0 == -boffset[0])
-        assert (pad_w0 == -boffset[1])
-        for i, siz in zip([0, 1], [h, w]):
-            # make sure last block is inside
-            err_msg = 'Making sure last block is inside boffset' \
-                ' {} bstrides {} bcount {} size {}'.format(
-                boffset[i], bstrides[i], bcount[i], siz)
-            assert (boffset[i] + bstrides[i] * (bcount[i] - 1) < siz), err_msg
-    return BlockParams(
-        bsize=bsize, bsize_out=bsize_out, boffset=boffset, bcount=bcount, bstrides=bstrides)
-
-
-def convert_mask_to_indices(mask, block_params, tol, avgpool=False):
-    """
-    Converts a binary mask to sparse index format for custom CUDA kernel and TF ops.
-
-    :param mask:         [Tensor]   [N, H, W]. 1 indicates non-sparse locations. Dtype float32.
-    :param block_params  [tuple]    Contains bsize, boffset, bcount, bstrides.
-    :param tol:          [float]    Lower bound of occupancy for creating a rectangle.
-
-    :return          [tuple]
-        bin_counts:           [Tensor]. Number of active locations for each bin.
-        active_block_indices: [Tensor]. [M]. Center locations of M rectangles. Dtype int64.
-    """
-
-    def to_tensor(a, dtype):
-        if torch.is_tensor(a):
-            if a.dtype != dtype:
-                return a.to(dtype)
-            else:
-                return a
-        elif isinstance(a, list):
-            if torch.is_tensor(a[0]):
-                return torch.stack(a, 0)
-            else:
-                return torch.tensor(a, dtype=dtype)
-        else:
-            return torch.tensor(a, dtype=dtype)
-
-    counts, indices = sbnet.ops.reduce_mask(
-        mask,
-        block_params.bcount,
-        bsize=block_params.bsize,
-        bstride=block_params.bstrides,
-        boffset=block_params.boffset,
-        avgpool=avgpool,
-        tol=tol)
-    return ReduceMask(indices, counts)
-
-# Input x will be in NHWC format
-# w : (out_channels, in_channels/groups, kH, kW)
-def sparse_conv2d(x,
-         w,
-         indices,
-         block_params,
-         strides,
-         transpose=True,
-         atomic=False):
-    assert transpose, 'Only available when transpose is True'
-    # TODO calc ksize
-    p = sbnet.ops.sparse_gather(
-        x,
-        indices.bin_counts,
-        indices.active_block_indices,
-        bsize=block_params.bsize,
-        bstride=block_params.bstrides,
-        boffset=block_params.boffset,
-        transpose=transpose)
-
-    # Convolution on patches.
-    q = torch.nn.functional.conv2d(p, w, stride=strides[1:3], padding='valid')
-
-    # Allocate output tensor.
-    if strides[1] > 1 or strides[2] > 1:
-        x = torch.empty((x.size(0), x.size(1)//strides[1], x.size(2)//strides[2], x.size(3)),
-                device=x.device)
-
-    y = sbnet.ops.sparse_scatter(
-        q,
-        indices.bin_counts,
-        indices.active_block_indices,
-        x,
-        bsize=block_params.bsize_out,
-        bstride=block_params.bstrides,
-        boffset=(0, 0), # why 0 0?
-        add=False,
-        transpose=transpose,
-        atomic=atomic)
-
-    return y
+#counts, indices = sbnet.ops.reduce_mask(
+#    mask,
+#    block_params.bcount,
+#    bsize=block_params.bsize,
+#    bstride=block_params.bstrides,
+#    boffset=block_params.boffset,
+#    avgpool=avgpool,
+#    tol=tol)
+#return ReduceMask(indices, counts)
 
 class SparseBlock_Conv2d_BN_ReLU(torch.nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding='valid', 
-            bias=True):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, 
+            bias=True, bn_eps=1e-3, bn_momentum=0.01):
         super(SparseBlock_Conv2d_BN_ReLU, self).__init__()
 
-        assert (padding == 'same' and stride == 1) or padding == 'valid'
         self.kernel_size = kernel_size
         self.stride = stride
-        self.padding = padding
         self.conv_bn_relu = torch.nn.Sequential(
             # The convolution here will be always without padding.
-            # If needed, padding will be done by sparse gather.
+            # If needed, padding will be done explicitly
             torch.nn.Conv2d(in_channels, out_channels, kernel_size,
                 stride=stride, padding=0, bias=bias),
-            torch.nn.BatchNorm2d(out_channels, eps=1e-3, momentum=0.01),
+            torch.nn.BatchNorm2d(out_channels, eps=bn_eps, momentum=bn_momentum),
             torch.nn.ReLU()
         )
 
         # Computing this requires knowing the input size
+        # Wait for calibration
+        self.padding_params=None
         self.block_params=None
 
-    def init_block_params(self):
-        pass
+    # bcount : [H_bcount, W_bcount]
+    def calibration(self, inp_NHWC, bcount):
+        N, H, W, C = list(inp_NHWC.size())
+        H_bsize, H_bsize_out, H_boffset, H_bcount, H_bstride, H_pad = \
+                calc_block_params_and_padding_1d(bcount[0], H, self.kernel_size, self.stride)
+        W_bsize, W_bsize_out, W_boffset, W_bcount, W_bstride, W_pad = \
+                calc_block_params_and_padding_1d(bcount[1], W, self.kernel_size, self.stride)
+        # I am not sure whether calculating H and W params like this and simply
+        # merging is ok, but let's try!
+        if H_pad > 0 or W_pad > 0:
+            pad_bottom, pad_top = H_pad//2+(H_pad%2), H_pad//2
+            pad_right, pad_left = W_pad//2+(W_pad%2), W_pad//2
+            self.padding_params = (0, 0, pad_left, pad_right, pad_top, pad_bottom)
+ 
+        self.block_params= BlockParams(bsize=[H_bsize, W_bsize], bsize_out=[H_bsize_out, W_bsize_out],
+                boffset=[H_boffset, W_boffset], bcount=bcount, bstrides=[H_bstride, W_bstride])
+ 
+        # Run the convolution once with full mask 
+        redu_mask = gen_full_reducemask(self.block_params.bcount)
+        return self(inp_NHWC, redu_mask)
 
-    def forward(self, x, indices, atomic=False, block_params=None):
+    def forward(self, inp_NHWC, redu_mask, atomic=False, block_params=None):
         bp = self.block_params if block_params is None else block_params
         assert bp is not None, 'Block parameters should either be initalized or given'
 
+        if self.padding_params is not None:
+            inp_NHWC = torch.nn.functional.pad(inp_NHWC, self.padding_params)
+
         p = sbnet.ops.sparse_gather(
-            x,
-            indices.bin_counts,
-            indices.active_block_indices,
+            inp_NHWC,
+            redu_mask.bin_counts,
+            redu_mask.active_block_indices,
             bsize=bp.bsize,
             bstride=bp.bstrides,
             boffset=bp.boffset,
@@ -196,32 +117,26 @@ class SparseBlock_Conv2d_BN_ReLU(torch.nn.Module):
         q = self.conv_bn_relu(p)
 
         # Allocate output tensor
-        # Assumes dilation is 1
-        outp_sz = list(x.size())
-        if self.padding == 'valid':
-            ksz = self.kernel_size
-            outp_sz = [outp_sz[0],
-                    floor(float(outp_sz[1] - (ksz-1) - 1) / self.stride + 1),
-                    floor(float(outp_sz[2] - (ksz-1) - 1) / self.stride + 1),
-                    outp_sz[3]]
-        out = torch.empty(outp_sz, device=x.device)
+        outp_sz = [inp_NHWC.size(0), #N
+            calc_out_size(bp.bcount[0], bp.bsize[0], 
+                    self.kernel_size, self.stride), #H
+            calc_out_size(bp.bcount[1], bp.bsize[1],
+                    self.kernel_size, self.stride), #W
+            inp_NHWC.size(3), #C
+        ]
+
+        out = torch.empty(outp_sz, dtype=inp_NHWC.dtype, device=inp_NHWC.device)
 
         y = sbnet.ops.sparse_scatter(
             q,
-            indices.bin_counts,
-            indices.active_block_indices,
+            redu_mask.bin_counts,
+            redu_mask.active_block_indices,
             out,
             bsize=bp.bsize_out,
             bstride=bp.bstrides,
-            boffset=(0, 0), # why 0 0?, 
+            boffset=bp.boffset,
             add=False,
             transpose=True,
             atomic=atomic)
 
         return y
-
-#example bsize: [1, 16, 16, 1], ksize: [3, 3, in_C, out_C],
-#strides: [1, 1, 1, 1], padding: 'same'
-
-#example bsize: [1, 17, 17, 1], ksize: [3, 3, in_C, out_C],
-#strides: [1, 2, 2, 1], padding: 'same'
