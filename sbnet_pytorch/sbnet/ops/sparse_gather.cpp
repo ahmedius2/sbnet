@@ -126,33 +126,28 @@ torch::Tensor SparseGather(torch::Tensor x,
 	int bOffsH0 = boffset_dynamic.first;
 	int bOffsW0 = boffset_dynamic.second;
 
-	// Grabs input shape.
-	// BE CAREFUL, THE SHAPE IS NHWC !!!
-	int N = x.size(0);
-	int H = x.size(1);
-	int W = x.size(2);
-	int C = x.size(3);
-
-	//const Tensor& bin_counts_tensor = context->input(1);
-	// read the number of active blocks from bin_counts input that is expected to be always in host mem
-	// This could be in GPU MEM!
+    // read the number of active blocks from bin_counts input that is expected to be always in host mem
 	int32_t bin0Count = bin_counts_tensor[0].item<int32_t>();
 
+	// Grabs input shape. It's size appears as NCHW but the layout supposed to be NHWC
+	int N = x.size(0);
+	int C = x.size(1);
+	int H = x.size(2);
+	int W = x.size(3);
+
 	// Initializes output.
-	std::vector<int64_t> yShapeArr{ bin0Count, bSzH, bSzW, C };
-	if (transpose_)
-	{
-		// output is NCHW for tranposed version
-		yShapeArr[1] = C;
-		yShapeArr[2] = bSzH;
-		yShapeArr[3] = bSzW;
-	}
+    auto outp_mem_format = torch::MemoryFormat::ChannelsLast;
+	if (transpose_){
+        outp_mem_format = torch::MemoryFormat::Contiguous;
+    }
+	std::vector<int64_t> yShapeArr{ bin0Count, C, bSzH, bSzW};
 	auto x_device = x.device().type();
 	auto tensor_options = torch::TensorOptions()
 		.layout(torch::kStrided)
 		.dtype(x.scalar_type())
 		.device(x_device)
-		.requires_grad(false);
+		.requires_grad(x.requires_grad())
+        .memory_format(outp_mem_format);
 	torch::Tensor y = torch::empty(yShapeArr, tensor_options);
 
 	if (x_device == torch::kCPU){
@@ -177,7 +172,7 @@ torch::Tensor SparseGather(torch::Tensor x,
 torch::Tensor SparseScatter(torch::Tensor x,
 		torch::Tensor bin_counts_tensor,
 		torch::Tensor activeBlockIndices,
-		torch::Tensor ybase, // This was the input of gather, now it becomes output
+		std::vector<int64_t> out_size, // output tensor size
 		std::pair<int,int> bsize_dynamic,
 		std::pair<int,int> bstride_dynamic,
 		std::pair<int,int> boffset_dynamic,
@@ -185,12 +180,23 @@ torch::Tensor SparseScatter(torch::Tensor x,
 		bool add_,
 		bool atomic_)
 {
+        // if transpose is true:  x is read as NCHW
+        // if transpose is false: x is read as NHWC
+        // ybase is treated as NHWC always
 
-		// TODO IS NHWC OK?
-        int N = ybase.size(0);
-        int H = ybase.size(1);
-        int W = ybase.size(2);
-        int C = ybase.size(3);
+        auto x_device = x.device().type();
+        auto tensor_options = torch::TensorOptions()
+            .layout(torch::kStrided)
+            .dtype(x.scalar_type())
+            .device(x_device)
+            .requires_grad(x.requires_grad())
+            .memory_format(torch::MemoryFormat::ChannelsLast);
+        torch::Tensor outp = torch::empty(out_size, tensor_options);
+
+        int N = outp.size(0);
+        int C = outp.size(1);
+        int H = outp.size(2);
+        int W = outp.size(3);
 
 		int bSzH = bsize_dynamic.first;
 		int bSzW = bsize_dynamic.second;
@@ -207,12 +213,11 @@ torch::Tensor SparseScatter(torch::Tensor x,
 		int32_t bin0Count = bin_counts_tensor[0].item<int32_t>();
 
         // Splat/add x on top of y
-		// We have ybase allocated, use it as output
-		auto x_device = x.device().type();
+		// We have outp allocated, use it as output
 		if (x_device == torch::kCPU){
 			AT_DISPATCH_FLOATING_TYPES(x.scalar_type(), "SparseScatterCPU", ([&] {
 				SparseScatterCPU(
-					x.data_ptr<scalar_t>(), N, H, W, C, ybase.data_ptr<scalar_t>(),
+					x.data_ptr<scalar_t>(), N, H, W, C, outp.data_ptr<scalar_t>(),
 					bOffsH0, bOffsW0, bSzH, bSzW, bStrH, bStrW,
 					bin0Count, activeBlockIndices.data_ptr<int16_t>(),
 					add_, transpose_, atomic_
@@ -220,11 +225,11 @@ torch::Tensor SparseScatter(torch::Tensor x,
 			}));
 		}
 		else{
-			ybase = LaunchSparseScatterGPU(x, N, H, W, C, ybase,
+			LaunchSparseScatterGPU(x, N, H, W, C, outp,
 					bOffsH0, bOffsW0, bSzH, bSzW, bStrH, bStrW,
 					bin0Count, activeBlockIndices, add_, transpose_, atomic_);
 		}
 
-		return ybase;
+		return outp;
 }
 

@@ -1,5 +1,6 @@
 #include <torch/extension.h>
 #include <utility>
+#include <vector>
 
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -23,7 +24,7 @@ extern torch::Tensor SparseGather(torch::Tensor x,
 extern torch::Tensor SparseScatter(torch::Tensor x,
 		torch::Tensor bin_counts_tensor,
 		torch::Tensor activeBlockIndices,
-		torch::Tensor ybase, // This was the input of gather, now it becomes output
+		std::vector<int64_t> out_size,
 		std::pair<int,int> bsize_dynamic,
 		std::pair<int,int> bstride_dynamic,
 		std::pair<int,int> boffset_dynamic,
@@ -41,6 +42,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 		py::arg("transpose"));
 	m.def("sparse_scatter", &SparseScatter, "Scatter sparse blocks.",
 		py::arg("x"), py::arg("bin_counts"), py::arg("active_block_indices"),
-		py::arg("ybase"), py::arg("bsize"), py::arg("bstride"), py::arg("boffset"), 
+		py::arg("out_size"), py::arg("bsize"), py::arg("bstride"), py::arg("boffset"), 
 		py::arg("transpose"), py::arg("add"), py::arg("atomic"));
 }
