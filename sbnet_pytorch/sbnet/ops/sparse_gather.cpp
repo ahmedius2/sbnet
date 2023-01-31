@@ -189,9 +189,10 @@ torch::Tensor SparseScatter(torch::Tensor x,
             .layout(torch::kStrided)
             .dtype(x.scalar_type())
             .device(x_device)
-            .requires_grad(x.requires_grad())
-            .memory_format(torch::MemoryFormat::ChannelsLast);
+            .requires_grad(x.requires_grad());
+        //    .memory_format(torch::MemoryFormat::ChannelsLast); // not working
         torch::Tensor outp = torch::zeros(out_size, tensor_options);
+	outp = outp.to(torch::MemoryFormat::ChannelsLast);
 
         int N = outp.size(0);
         int C = outp.size(1);

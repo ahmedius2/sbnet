@@ -39,7 +39,6 @@ def gen_full_reducemask(bcount):
     for i in range(bcount[0]):
         for j in range(bcount[1]):
             inds[i * bcount[1] + j] = torch.tensor((0, i, j), dtype=torch.int16)
-    #print('inds', inds)
     inds = inds.cuda()
     counts = torch.full((1,), max_num_blocks, dtype=torch.int32)
     return ReduceMask(inds, counts)
@@ -70,7 +69,7 @@ class SparseGatherFunction(torch.autograd.Function):
         do_transpose = ctx.do_transpose
         inp_size = ctx.inp_size
 
-        scat_plane= sbnet.ops.sparse_scatter(
+        grad_scat_plane= sbnet.ops.sparse_scatter(
             grad_stacked_slices,
             redu_mask.bin_counts,
             redu_mask.active_block_indices,
@@ -82,7 +81,7 @@ class SparseGatherFunction(torch.autograd.Function):
             add=True,
             atomic=True)
 
-        return scat_plane, None, None, None
+        return grad_scat_plane, None, None, None
 
 class SparseScatterFunction(torch.autograd.Function):
     @staticmethod
@@ -93,7 +92,7 @@ class SparseScatterFunction(torch.autograd.Function):
             redu_mask.active_block_indices,
             outp_sz,
             bsize=bp.bsize_out,
-            bstride=bp.bstrides,
+            bstride=bp.bsize_out,
             boffset=bp.boffset,
             transpose=do_transpose,
             add=do_add,
@@ -116,7 +115,7 @@ class SparseScatterFunction(torch.autograd.Function):
             redu_mask.bin_counts,
             redu_mask.active_block_indices,
             bsize=bp.bsize_out,
-            bstride=bp.bstrides,
+            bstride=bp.bsize_out,
             boffset=bp.boffset,
             transpose=do_transpose)
 
@@ -211,15 +210,6 @@ class SparseBlock_Conv2d_BN_ReLU(torch.nn.Module):
                 inp_NHWC = torch.nn.functional.pad(inp_NHWC, self.padding_params)
 
         p = SparseGatherFunction.apply(inp_NHWC, redu_mask, bp, self.transpose)
-#        p = sbnet.ops.sparse_gather(
-#            inp_NHWC,
-#            redu_mask.bin_counts,
-#            redu_mask.active_block_indices,
-#            bsize=bp.bsize,
-#            bstride=bp.bstrides,
-#            boffset=bp.boffset,
-#            transpose=self.transpose)
-
 
         # Convolution on patches.
         q = self.conv_bn_relu(p)
@@ -235,20 +225,6 @@ class SparseBlock_Conv2d_BN_ReLU(torch.nn.Module):
 
         y = SparseScatterFunction.apply(q, redu_mask, outp_sz, bp, False, \
                 self.transpose, atomic)
-#        y = sbnet.ops.sparse_scatter(
-#            q,
-#            redu_mask.bin_counts,
-#            redu_mask.active_block_indices,
-#            outp_sz,
-#            bsize=bp.bsize_out,
-#            bstride=bp.bstrides,
-#            boffset=bp.boffset,
-#            add=False,
-#            transpose=self.transpose,
-#            atomic=atomic)
         #torch.cuda.nvtx.range_pop()
-
-        #print(bp)
-        #print('Sizes:', inp_NHWC.size(), p.size(), q.size(), y.size())
 
         return (y, redu_mask)
