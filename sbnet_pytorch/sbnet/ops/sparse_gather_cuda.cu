@@ -257,7 +257,7 @@ torch::Tensor LaunchSparseScatterGPU(
 		if (!hasInst) {
 			//printf("scatter, C, bSzH, bSzW=%d, %d, %d, fittingC1=%d\n", C, bSzH, bSzW, lp.fittingC1);
 			blockScatterTiled1<scalar_t, 512><<<lp.grid, lp.block, lp.shmemSize, stream>>>(
-				x.data_ptr<scalar_t>(), (const int16_t*)activeBlockIndices.data_ptr<scalar_t>(),
+				x.data_ptr<scalar_t>(), (const int16_t*)activeBlockIndices.data_ptr<int16_t>(),
 				y.data_ptr<scalar_t>(), N, H, W, C, bOffsH0, bOffsW0, bStrH, bStrW,
 				bSzH, lp.bSzH1, bSzW, lp.fittingC1, add, transpose, atomic);
 		}

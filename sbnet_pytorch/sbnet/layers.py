@@ -78,8 +78,8 @@ class SparseGatherFunction(torch.autograd.Function):
             bsize=bp.bsize,
             bstride=bp.bstrides,
             boffset=bp.boffset,
-            add=True,
             transpose=do_transpose,
+            add=True,
             atomic=True)
 
         return scat_plane, None, None, None
@@ -95,8 +95,8 @@ class SparseScatterFunction(torch.autograd.Function):
             bsize=bp.bsize_out,
             bstride=bp.bstrides,
             boffset=bp.boffset,
-            add=do_add,
             transpose=do_transpose,
+            add=do_add,
             atomic=do_atomic)
 
         ctx.redu_mask = redu_mask

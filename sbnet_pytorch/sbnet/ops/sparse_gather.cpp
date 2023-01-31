@@ -148,7 +148,7 @@ torch::Tensor SparseGather(torch::Tensor x,
 		.device(x_device)
 		.requires_grad(x.requires_grad())
         .memory_format(outp_mem_format);
-	torch::Tensor y = torch::empty(yShapeArr, tensor_options);
+	torch::Tensor y = torch::zeros(yShapeArr, tensor_options);
 
 	if (x_device == torch::kCPU){
 		AT_DISPATCH_FLOATING_TYPES(x.scalar_type(), "SparseGatherCPU", ([&] {
@@ -191,7 +191,7 @@ torch::Tensor SparseScatter(torch::Tensor x,
             .device(x_device)
             .requires_grad(x.requires_grad())
             .memory_format(torch::MemoryFormat::ChannelsLast);
-        torch::Tensor outp = torch::empty(out_size, tensor_options);
+        torch::Tensor outp = torch::zeros(out_size, tensor_options);
 
         int N = outp.size(0);
         int C = outp.size(1);
@@ -225,7 +225,7 @@ torch::Tensor SparseScatter(torch::Tensor x,
 			}));
 		}
 		else{
-			LaunchSparseScatterGPU(x, N, H, W, C, outp,
+			outp = LaunchSparseScatterGPU(x, N, H, W, C, outp,
 					bOffsH0, bOffsW0, bSzH, bSzW, bStrH, bStrW,
 					bin0Count, activeBlockIndices, add_, transpose_, atomic_);
 		}
