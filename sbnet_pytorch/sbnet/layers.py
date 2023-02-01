@@ -69,6 +69,9 @@ class SparseGatherFunction(torch.autograd.Function):
         do_transpose = ctx.do_transpose
         inp_size = ctx.inp_size
 
+        if not grad_stacked_slices.is_contiguous():
+            grad_stacked_slices = grad_stacked_slices.to(memory_format=torch.contiguous)
+
         grad_scat_plane= sbnet.ops.sparse_scatter(
             grad_stacked_slices,
             redu_mask.bin_counts,
@@ -80,6 +83,8 @@ class SparseGatherFunction(torch.autograd.Function):
             transpose=do_transpose,
             add=True,
             atomic=True)
+
+        #assert grad_scat_plane.is_contiguous(memory_format=torch.channels_last)
 
         return grad_scat_plane, None, None, None
 
@@ -110,6 +115,9 @@ class SparseScatterFunction(torch.autograd.Function):
         bp = ctx.bp
         do_transpose = ctx.do_transpose
 
+        if not grad_scat_plane.is_contiguous(memory_format=torch.channels_last):
+            grad_scat_plane = grad_scat_plane.to(memory_format=torch.channels_last)
+
         grad_stacked_slices = sbnet.ops.sparse_gather(
             grad_scat_plane,
             redu_mask.bin_counts,
@@ -118,6 +126,8 @@ class SparseScatterFunction(torch.autograd.Function):
             bstride=bp.bsize_out,
             boffset=bp.boffset,
             transpose=do_transpose)
+
+        #assert grad_stacked_slices.is_contiguous()
 
         return grad_stacked_slices, None, None, None, None, None, None
 
@@ -178,10 +188,11 @@ class SparseBlock_Conv2d_BN_ReLU(torch.nn.Module):
         # Run the convolution once with full mask 
         redu_mask = gen_full_reducemask(self.block_params.bcount)
 
-        # Try all input sizes for benchmarking
-        while redu_mask.bin_counts.item() > 0:
-            self.forward((inp_NHWC, redu_mask))
-            redu_mask.bin_counts[0] -= 1
+        if not self.training:
+            # Try all input sizes for benchmarking
+            while redu_mask.bin_counts.item() > 0:
+                self.forward((inp_NHWC, redu_mask))
+                redu_mask.bin_counts[0] -= 1
 
     # args are supposed to be: inp_NHWC, redu_mask, atomic=False, block_params=None):
     def forward(self, args):
@@ -211,6 +222,26 @@ class SparseBlock_Conv2d_BN_ReLU(torch.nn.Module):
 
         p = SparseGatherFunction.apply(inp_NHWC, redu_mask, bp, self.transpose)
 
+#        # DEBUG check if gather works as expected
+#        inds = redu_mask.active_block_indices.cpu()
+#        slices=[]
+#        for ind in inds:
+#            xpos = ind[1]*bp.bstrides[0]
+#            ypos = ind[2]*bp.bstrides[1]
+#            slc = inp_NHWC[ind[0]:(ind[0]+1), ..., xpos:(xpos+bp.bsize[0]), ypos:(ypos+bp.bsize[1])]
+#            slices.append(slc)
+#        slices = torch.cat(slices, dim=0)
+#        if self.transpose:
+#            slices = slices.to(memory_format=torch.contiguous_format)
+
+#        if not torch.equal(p, slices):
+#            print('SparseGather is not working properly!')
+#            print('expected:', slices.size(), 'but got:', p.size())
+
+#        for slc in p:
+#            if torch.all(slc == 0).cpu().item():
+#                print('A gathered slice is all zeros!')
+
         # Convolution on patches.
         q = self.conv_bn_relu(p)
 
@@ -225,6 +256,21 @@ class SparseBlock_Conv2d_BN_ReLU(torch.nn.Module):
 
         y = SparseScatterFunction.apply(q, redu_mask, outp_sz, bp, False, \
                 self.transpose, atomic)
+
+#        # DEBUG check if scatter works as expected
+#        scat_plane = torch.zeros(outp_sz, dtype=q.dtype, device=q.device)
+#        for slc, ind in zip(q, inds):
+#            xpos = ind[1]*bp.bsize_out[0]
+#            ypos = ind[2]*bp.bsize_out[1]
+#            scat_plane[ind[0], ..., xpos:(xpos+bp.bsize_out[0]), ypos:(ypos+bp.bsize_out[1])] = slc
+#
+#        if self.transpose:
+#            scat_plane = scat_plane.to(memory_format=torch.channels_last)
+#        if not torch.equal(y, scat_plane):
+#            print('SparseScatter is not working properly!')
+#            print('expected:', y.size(), 'but got:', scat_plane.size())
+
+
         #torch.cuda.nvtx.range_pop()
 
         return (y, redu_mask)
