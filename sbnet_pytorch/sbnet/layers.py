@@ -70,7 +70,7 @@ class SparseGatherFunction(torch.autograd.Function):
         inp_size = ctx.inp_size
 
         if not grad_stacked_slices.is_contiguous():
-            grad_stacked_slices = grad_stacked_slices.to(memory_format=torch.contiguous)
+            grad_stacked_slices = grad_stacked_slices.to(memory_format=torch.contiguous_format)
 
         grad_scat_plane= sbnet.ops.sparse_scatter(
             grad_stacked_slices,
@@ -131,42 +131,26 @@ class SparseScatterFunction(torch.autograd.Function):
 
         return grad_stacked_slices, None, None, None, None, None, None
 
-class SparseBlock_Conv2d_BN_ReLU(torch.nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, stride=1, 
-            bias=True, bn_eps=1e-3, bn_momentum=0.01, bcount=None, 
-            transpose=False, deconv=False):
-        super(SparseBlock_Conv2d_BN_ReLU, self).__init__()
+# Abstract class
+class SparseBlock(torch.nn.Module):
+    def __init__(self, bcount=None, transpose=False):
+        super().__init__()
 
-        self.invpad = False
-        self.kernel_size = kernel_size
-        self.stride = stride
-        self.out_channels = out_channels
-        self.deconv=deconv
-        self.padding_params=None
-        self.block_params=None
+        self.conv = None
+        self.kernel_size = None
+        self.stride = None
+        self.out_channels = None
+        self.deconv = None
+        self.padding_params = None
+        self.block_params = None
         self.bcount=bcount
         self.transpose=transpose
-        if self.deconv:
-            assert kernel_size == stride, 'Deconv supported only if the condition holds'
-            conv = torch.nn.ConvTranspose2d(in_channels, out_channels, kernel_size,
-                    stride=stride, padding=0, bias=bias)
-        else:
-            conv = torch.nn.Conv2d(in_channels, out_channels, kernel_size,
-                    stride=stride, padding=0, bias=bias)
-        self.conv_bn_relu = torch.nn.Sequential(
-            # The convolution here will be always without padding.
-            # If needed, padding will be done explicitly
-            conv,
-            torch.nn.BatchNorm2d(out_channels, eps=bn_eps, momentum=bn_momentum),
-            torch.nn.ReLU()
-        )
-        if not self.transpose:
-            self.conv_bn_relu = self.conv_bn_relu.to(memory_format=torch.channels_last)
 
+        self.invpad = False
 
     # bcount : [H_bcount, W_bcount]
     def calibrate(self, inp_NHWC, bcount=None):
-        assert bcount is not None or self.bcount is not None
+        assert (bcount is not None or self.bcount is not None) and self.conv is not None
         bcount = self.bcount if bcount is None else bcount
         N, C, H, W = list(inp_NHWC.size())
         H_bsize, H_bsize_out, H_boffset, H_bcount, H_bstride, H_pad = \
@@ -196,7 +180,8 @@ class SparseBlock_Conv2d_BN_ReLU(torch.nn.Module):
 
     # args are supposed to be: inp_NHWC, redu_mask, atomic=False, block_params=None):
     def forward(self, args):
-        #print(args)
+        assert self.conv is not None
+
         inp_NHWC=args[0]
         redu_mask=args[1]
         atomic = args[2] if len(args)>2 else False
@@ -243,7 +228,7 @@ class SparseBlock_Conv2d_BN_ReLU(torch.nn.Module):
 #                print('A gathered slice is all zeros!')
 
         # Convolution on patches.
-        q = self.conv_bn_relu(p)
+        q = self.conv(p)
 
         # Allocate output tensor as NHWC
         outp_sz = [int(inp_NHWC.size(0)), #N
@@ -274,3 +259,55 @@ class SparseBlock_Conv2d_BN_ReLU(torch.nn.Module):
         #torch.cuda.nvtx.range_pop()
 
         return (y, redu_mask)
+
+class SparseBlock_Conv2d(SparseBlock):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, groups=1,
+            bias=True, bcount=None, transpose=False, deconv=False):
+        super().__init__(bcount, transpose)
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.out_channels = out_channels
+        self.deconv=deconv
+        self.groups=groups
+
+        if self.deconv:
+            assert kernel_size == stride, 'Deconv supported only if the condition holds'
+            self.conv = torch.nn.ConvTranspose2d(in_channels, out_channels, kernel_size,
+                    stride=stride, padding=0, groups=self.groups, bias=bias)
+        else:
+            self.conv = torch.nn.Conv2d(in_channels, out_channels, kernel_size,
+                    stride=stride, padding=0, groups=self.groups, bias=bias)
+
+        if not self.transpose:
+            self.conv = self.conv.to(memory_format=torch.channels_last)
+
+    def fill_bias(self, val):
+        self.conv.bias.data.fill_(val)
+
+class SparseBlock_Conv2d_BN_ReLU(SparseBlock_Conv2d):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, groups=1,
+            bias=True, bn_eps=1e-05, bn_momentum=0.1, norm_groups=None, bcount=None, 
+            transpose=False, deconv=False):
+        super().__init__(in_channels, out_channels, kernel_size, stride,
+                groups, bias, bcount, transpose, deconv)
+
+        # maybe this is unnecessary, but anyway
+        if not self.transpose:
+            self.conv = self.conv.to(memory_format=torch.contiguous_format)
+
+        # if groups are more than one, use group convolution?
+        if norm_groups is None:
+            norm_groups = groups
+
+        if norm_groups == 1:
+            norm = torch.nn.BatchNorm2d(out_channels, eps=bn_eps, momentum=bn_momentum)
+        else:
+            norm = torch.nn.GroupNorm(norm_groups, out_channels, eps=bn_eps)
+            print('using group norm')
+        self.conv = torch.nn.Sequential(self.conv, norm, torch.nn.ReLU())
+
+        if not self.transpose:
+            self.conv = self.conv.to(memory_format=torch.channels_last)
+    
+    def fill_bias(self, val):
+        self.conv[0].bias.data.fill_(val)
