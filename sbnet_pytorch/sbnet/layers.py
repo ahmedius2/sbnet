@@ -36,7 +36,6 @@ def calc_block_params_and_padding_1d(bcount, insize, ksize, stride, deconv=False
     return (bsize, bsize_out, boffset, bcount, bstride, abs(pad))
 
 def calc_block_params(inp, bcount, ksize, stride, deconv=False, invpad=False):
-    #N, C, H, W = list(inp.size())
     N, H, W, C = list(inp.size())
     H_bsize, H_bsize_out, H_boffset, H_bcount, H_bstride, H_pad = \
             calc_block_params_and_padding_1d(bcount[0], H, ksize, \
@@ -49,31 +48,32 @@ def calc_block_params(inp, bcount, ksize, stride, deconv=False, invpad=False):
     if H_pad > 0 or W_pad > 0:
         pad_bottom, pad_top = H_pad//2+(H_pad%2), H_pad//2
         pad_right, pad_left = W_pad//2+(W_pad%2), W_pad//2
-        #padding_params = (pad_left, pad_right, pad_top, pad_bottom, 0, 0)
         padding_params = (0, 0, pad_left, pad_right, pad_top, pad_bottom)
 
     return BlockParams(bsize=[H_bsize, W_bsize], bsize_out=[H_bsize_out, W_bsize_out],
             boffset=[H_boffset, W_boffset], bcount=bcount, bstrides=[H_bstride, W_bstride],
             padding=padding_params)
 
-def gen_reducemask(bcount, sparsity=0.):
+def gen_reducemask(bcount, sparsity=0., batch_size=1):
     assert sparsity >= 0. and sparsity < 1.
-    max_num_blocks= bcount[0] * bcount[1]
+    max_num_blocks= bcount[0] * bcount[1] * batch_size
     inds = torch.empty((max_num_blocks, 3), dtype=torch.int16)
-    for i in range(bcount[0]):
-        for j in range(bcount[1]):
-            inds[i * bcount[1] + j] = torch.tensor((0, i, j), dtype=torch.int16)
+    for b in range(batch_size):
+        for i in range(bcount[0]):
+            for j in range(bcount[1]):
+                idx = b * bcount[0] * bcount[1] + i * bcount[1] + j
+                inds[idx] = torch.tensor((b, i, j), dtype=torch.int16)
     inds = inds.cuda()
-    counts = torch.full((1,), (bcount[0] * bcount[1]) * (1.0 - sparsity), \
+    counts = torch.full((1,), max_num_blocks * (1.0 - sparsity), \
             dtype=torch.int32)
-    perms = torch.randperm(bcount[0] * bcount[1]) # shuffle
-    return ReduceMask(inds[perms], counts)
+    perms = torch.randperm(max_num_blocks) # shuffle
+    return ReduceMask(inds[perms][:perms.size(0)], counts)
 
 class SparseGatherFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, inp, redu_mask, bp, do_transpose):
         stacked_slices = sbnet.ops.sparse_gather(
-            inp,
+            inp.contiguous(),
             redu_mask.bin_counts,
             redu_mask.active_block_indices,
             bsize=bp.bsize,
@@ -95,11 +95,8 @@ class SparseGatherFunction(torch.autograd.Function):
         do_transpose = ctx.do_transpose
         inp_size = ctx.inp_size
 
-        #if not grad_stacked_slices.is_contiguous():
-        #    grad_stacked_slices = grad_stacked_slices.to(memory_format=torch.contiguous_format)
-
         grad_scat_plane= sbnet.ops.sparse_scatter(
-            grad_stacked_slices,
+            grad_stacked_slices.contiguous(),
             redu_mask.bin_counts,
             redu_mask.active_block_indices,
             inp_size,
@@ -110,15 +107,13 @@ class SparseGatherFunction(torch.autograd.Function):
             add=True,
             atomic=True)
 
-        #assert grad_scat_plane.is_contiguous(memory_format=torch.channels_last)
-
         return grad_scat_plane, None, None, None
 
 class SparseScatterFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, inp, redu_mask, outp_sz, bp, do_add, do_transpose, do_atomic):
         scat_plane = sbnet.ops.sparse_scatter(
-            inp,
+            inp.contiguous(),
             redu_mask.bin_counts,
             redu_mask.active_block_indices,
             outp_sz,
@@ -141,19 +136,14 @@ class SparseScatterFunction(torch.autograd.Function):
         bp = ctx.bp
         do_transpose = ctx.do_transpose
 
-        #if not grad_scat_plane.is_contiguous(memory_format=torch.channels_last):
-        #    grad_scat_plane = grad_scat_plane.to(memory_format=torch.channels_last)
-
         grad_stacked_slices = sbnet.ops.sparse_gather(
-            grad_scat_plane,
+            grad_scat_plane.contiguous(),
             redu_mask.bin_counts,
             redu_mask.active_block_indices,
             bsize=bp.bsize_out,
             bstride=bp.bsize_out,
             boffset=bp.boffset,
             transpose=do_transpose)
-
-        #assert grad_stacked_slices.is_contiguous()
 
         return grad_stacked_slices, None, None, None, None, None, None
 
@@ -186,21 +176,23 @@ class SparseBlock(torch.nn.Module):
 
         print('Calibrating block params for input ', inp.size(),' :', self.block_params)
 
-        if not self.in_chain and not self.training:
-            redu_mask = gen_reducemask(self.block_params.bcount)
+        if torch.backends.cudnn.benchmark and not self.in_chain and not self.training:
+            redu_mask = gen_reducemask(self.block_params.bcount, batch_size=inp.size(0))
             # Try all input sizes for benchmarking, takes a long time...
+            data_dict = {'sbnet_x': inp, 'reduce_mask':redu_mask,
+                            'batch_size': inp.size(0)}
             while redu_mask.bin_counts.item() > 0:
-                self.forward((inp, redu_mask))
-                redu_mask.bin_counts[0] -= 1
+                self(data_dict)
+                data_dict['reduce_mask'].bin_counts[0] -= 1
 
-    # args are supposed to be: inp, redu_mask, atomic=False, block_params=None):
-    def forward(self, args):
+    def forward(self, data_dict):
         assert self.conv is not None
 
-        inp=args[0]
-        redu_mask=args[1]
-        atomic = args[2] if len(args)>2 else False
-        block_params= args[3] if len(args)>3 else None
+        inp = data_dict['sbnet_x']
+        redu_mask = data_dict['reduce_mask']
+        batch_size = data_dict['batch_size'] if 'batch_size' in data_dict else 1
+        atomic = data_dict['atomic'] if 'atomic' in data_dict else False
+        block_params = data_dict['block_params'] if 'block_params' in data_dict else None
 
         #assert inp.is_contiguous(memory_format=torch.channels_last)
         # If training, do regular convolution
@@ -209,8 +201,6 @@ class SparseBlock(torch.nn.Module):
             self.calibrate(inp, self.bcount)
 
         bp = self.block_params if block_params is None else block_params
-        #assert bp is not None, 'Block parameters should either be initalized or given'
-        #torch.cuda.nvtx.range_push(f'SBC_inp_{list(inp.size())}')
 
         if self.do_gather:
             padding_params = bp.padding
@@ -250,8 +240,6 @@ class SparseBlock(torch.nn.Module):
 
         if self.do_scatter:
             # Allocate output tensor as NHWC
-            # TODO batch size can be different than 1 in case of no gather
-            batch_size = 1
             outp_sz = [batch_size, #N 
                 int(calc_out_size_1d(bp.bcount[0], bp.bsize[0], 
                         self.kernel_size, self.stride, self.deconv)), #H
@@ -278,10 +266,9 @@ class SparseBlock(torch.nn.Module):
 #            print('SparseScatter is not working properly!')
 #            print('expected:', y.size(), 'but got:', scat_plane.size())
 
+        data_dict['sbnet_y'] = y
 
-        #torch.cuda.nvtx.range_pop()
-
-        return (y, redu_mask)
+        return data_dict
 
 class SparseBlock_Conv2d(SparseBlock):
     def __init__(self, in_channels, out_channels, kernel_size, stride=1, groups=1,
@@ -301,14 +288,11 @@ class SparseBlock_Conv2d(SparseBlock):
             self.conv = torch.nn.Conv2d(in_channels, out_channels, kernel_size,
                     stride=stride, padding=0, groups=self.groups, bias=bias)
 
-        #if not self.transpose:
-        #    self.conv = self.conv.to(memory_format=torch.channels_last)
-
     def fill_bias(self, val):
         self.conv.bias.data.fill_(val)
 
-    def forward(self, args):
-        return super().forward(args)
+#    def forward(self, data_dict):
+#        return super().forward(data_dict)
 
 class SparseBlock_Conv2d_BN_ReLU(SparseBlock_Conv2d):
     def __init__(self, in_channels, out_channels, kernel_size, stride=1, groups=1,
@@ -317,11 +301,7 @@ class SparseBlock_Conv2d_BN_ReLU(SparseBlock_Conv2d):
         super().__init__(in_channels, out_channels, kernel_size, stride,
                 groups, bias, bcount, transpose, deconv)
 
-        # maybe this is unnecessary, but anyway
-        #if not self.transpose:
-        #    self.conv = self.conv.to(memory_format=torch.contiguous_format)
-
-        # if groups are more than one, use group convolution?
+        # if groups are more than one, use group convolution
         if norm_groups is None:
             norm_groups = groups
 
@@ -331,14 +311,11 @@ class SparseBlock_Conv2d_BN_ReLU(SparseBlock_Conv2d):
             norm = torch.nn.GroupNorm(norm_groups, out_channels, eps=bn_eps)
         self.conv = torch.nn.Sequential(self.conv, norm, torch.nn.ReLU())
 
-        #if not self.transpose:
-        #    self.conv = self.conv.to(memory_format=torch.channels_last)
-    
     def fill_bias(self, val):
         self.conv[0].bias.data.fill_(val)
 
-    def forward(self, args):
-        return super().forward(args)
+#    def forward(self, data_dict):
+#        return super().forward(data_dict)
 
 class SparseBlock_ConvChain(torch.nn.Module):
     def __init__(self, sg_mask=None):
@@ -348,14 +325,19 @@ class SparseBlock_ConvChain(torch.nn.Module):
         self.calibrated = False
         self.hardcoded_sg_mask = sg_mask
 
-    def forward(self, args):
-        #assert args[0].is_contiguous(memory_format=torch.channels_last)
+    def forward(self, data_dict):
         if not self.calibrated:
-            self.calibrate(args)
+            initial_x = data_dict['sbnet_x']
+            self.calibrate(data_dict)
+            data_dict['sbnet_x'] = initial_x
 
+        initial_x = data_dict['sbnet_x']
         for conv in self.conv_list:
-            args = conv.forward(args)
-        return args
+            data_dict = conv(data_dict)
+            data_dict['sbnet_x'] = data_dict['sbnet_y']
+        data_dict['sbnet_x'] = initial_x
+
+        return data_dict
 
     def append_conv(self, conv_module):
         assert isinstance(conv_module, SparseBlock_Conv2d_BN_ReLU) or \
@@ -389,7 +371,6 @@ class SparseBlock_ConvChain(torch.nn.Module):
                 bp = self.conv_list[chain_end_idx].block_params
                 if conv_idx == chain_end_idx:
                     # Same layer gathers and scatters, proceed to next
-                    #print(f'Block params for conv {conv_idx}: {bp}')
                     conv_idx += 1
                 else:
                     # Chain detected, update the block params of gathering layer
@@ -411,8 +392,6 @@ class SparseBlock_ConvChain(torch.nn.Module):
                     inp_size = inp_sizes[conv_idx]
                     req_inp_size_H = (bp.bcount[0]  - 1) * bstrides[0] + bsize[0]
                     req_inp_size_W = (bp.bcount[1]  - 1) * bstrides[1] + bsize[1]
-                    #H_pad = req_inp_size_H - inp_size[2]
-                    #W_pad = req_inp_size_W - inp_size[3]
                     H_pad = req_inp_size_H - inp_size[1]
                     W_pad = req_inp_size_W - inp_size[2]
                     assert H_pad >= 0 and W_pad >= 0
@@ -429,16 +408,17 @@ class SparseBlock_ConvChain(torch.nn.Module):
                     conv_idx = chain_end_idx + 1 # proceed to next gather
 
 
-    def calibrate(self, args):
+    def calibrate(self, data_dict):
         # First, run through the network to calculate default block params
 
-        #assert args[0].is_contiguous(memory_format=torch.channels_last)
         inp_sizes = []
         default_bps = []
-        initial_inp=args[0]
+        initial_inp = data_dict['sbnet_x']
+        batch_size = data_dict['batch_size']
         for conv in self.conv_list:
-            inp_sizes.append(args[0].size())
-            args = conv.forward(args)
+            inp_sizes.append(data_dict['sbnet_x'].size())
+            data_dict = conv(data_dict)
+            data_dict['sbnet_x'] = data_dict['sbnet_y']
             default_bps.append(conv.block_params)
 
         self.calibrated=True # To prevent recursive calibrate call
@@ -462,12 +442,16 @@ class SparseBlock_ConvChain(torch.nn.Module):
                 for sparsity in sparsities:
                     gc.collect()
                     # Block count is same for everyone
-                    args = (initial_inp, gen_reducemask(default_bps[0].bcount, sparsity))
-                    self.forward(args) # this call is to invoke cudnn benchmarking
+                    data_dict = {'sbnet_x':initial_inp,
+                            'reduce_mask': gen_reducemask(default_bps[0].bcount, \
+                                sparsity, batch_size),
+                            'batch_size': batch_size}
+                    # This call is to invoke cudnn benchmarking and to heat the cache
+                    self(data_dict)
                     torch.cuda.synchronize()
                     t1 = time.time()
                     for i in range(repetition):
-                        self.forward(args)
+                        self(data_dict)
                     torch.cuda.synchronize()
                     tdiff_ms = round((time.time()-t1)/repetition*1000,2)
                     time_ms_per_sparsity.append(tdiff_ms)
@@ -491,11 +475,12 @@ class SparseBlock_ConvChain(torch.nn.Module):
         print('Decided to use the mask', best_sg_mask)
         self.__update_block_params(best_sg_mask, default_bps, inp_sizes)
 
-        print('Calibrating the chain w.r.t. chosen mask...')
-        redu_mask = gen_reducemask(default_bps[0].bcount)
         # Try all input sizes for benchmarking, takes a long time...
-        while redu_mask.bin_counts.item() > 0:
-            self.forward((initial_inp, redu_mask))
-            redu_mask.bin_counts[0] -= 1
-
-
+        if torch.backends.cudnn.benchmark and not self.training:
+            print('Calibrating the chain w.r.t. chosen mask...')
+            redu_mask = gen_reducemask(default_bps[0].bcount, batch_size=batch_size)
+            data_dict = {'sbnet_x': initial_inp, 'reduce_mask':redu_mask,
+                            'batch_size': batch_size}
+            while redu_mask.bin_counts.item() > 0:
+                self(data_dict)
+                data_dict['reduce_mask'].bin_counts[0] -= 1
