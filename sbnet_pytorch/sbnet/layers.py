@@ -54,7 +54,7 @@ def calc_block_params(inp, bcount, ksize, stride, deconv=False, invpad=False):
             boffset=[H_boffset, W_boffset], bcount=bcount, bstrides=[H_bstride, W_bstride],
             padding=padding_params)
 
-def gen_reducemask(bcount, sparsity=0., batch_size=1):
+def gen_reducemask(bcount, sparsity=0., batch_size=1, shuffle=False):
     assert sparsity >= 0. and sparsity < 1.
     max_num_blocks= bcount[0] * bcount[1] * batch_size
     inds = torch.empty((max_num_blocks, 3), dtype=torch.int16)
@@ -62,12 +62,16 @@ def gen_reducemask(bcount, sparsity=0., batch_size=1):
         for i in range(bcount[0]):
             for j in range(bcount[1]):
                 idx = b * bcount[0] * bcount[1] + i * bcount[1] + j
-                inds[idx] = torch.tensor((b, i, j), dtype=torch.int16)
+                inds[idx] = torch.tensor((b, j, i), dtype=torch.int16)
     inds = inds.cuda()
     counts = torch.full((1,), max_num_blocks * (1.0 - sparsity), \
             dtype=torch.int32)
-    perms = torch.randperm(max_num_blocks) # shuffle
-    return ReduceMask(inds[perms][:perms.size(0)], counts)
+    if shuffle:
+        perms = torch.randperm(max_num_blocks) # shuffle
+        return ReduceMask(inds[perms][:perms.size(0)], counts)
+    else:
+        return ReduceMask(inds, counts)
+
 
 class SparseGatherFunction(torch.autograd.Function):
     @staticmethod
@@ -111,14 +115,14 @@ class SparseGatherFunction(torch.autograd.Function):
 
 class SparseScatterFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, inp, redu_mask, outp_sz, bp, do_add, do_transpose, do_atomic):
+    def forward(ctx, inp, redu_mask, outp_sz, bp, do_add, do_transpose, do_atomic, inp_not_reduced):
         scat_plane = sbnet.ops.sparse_scatter(
             inp.contiguous(),
             redu_mask.bin_counts,
             redu_mask.active_block_indices,
             outp_sz,
             bsize=bp.bsize_out,
-            bstride=bp.bsize_out,
+            bstride=bp.bstrides if inp_not_reduced else bp.bsize_out,
             boffset=bp.boffset,
             transpose=do_transpose,
             add=do_add,
@@ -127,6 +131,7 @@ class SparseScatterFunction(torch.autograd.Function):
         ctx.redu_mask = redu_mask
         ctx.bp = bp
         ctx.do_transpose = do_transpose
+        ctx.inp_not_reduced = inp_not_reduced
 
         return scat_plane
 
@@ -141,11 +146,11 @@ class SparseScatterFunction(torch.autograd.Function):
             redu_mask.bin_counts,
             redu_mask.active_block_indices,
             bsize=bp.bsize_out,
-            bstride=bp.bsize_out,
+            bstride=bp.bstrides if ctx.inp_not_reduced else bp.bsize_out,
             boffset=bp.boffset,
             transpose=do_transpose)
 
-        return grad_stacked_slices, None, None, None, None, None, None
+        return grad_stacked_slices, None, None, None, None, None, None, None
 
 # Abstract class
 class SparseBlock(torch.nn.Module):
